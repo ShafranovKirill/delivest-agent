@@ -107,6 +107,43 @@ defmodule DelivestAgent.CommandsTest do
     assert status["project"] == "delivest"
   end
 
+  test "env_read returns the .env of the project", %{project: project, dir: dir} do
+    assert {:ok, ""} = Commands.run("env_read", %{}, project)
+
+    File.write!(Path.join(dir, ".env"), "PHX_HOST=a.example.com\n")
+    assert {:ok, "PHX_HOST=a.example.com\n"} = Commands.run("env_read", %{}, project)
+  end
+
+  test "env_write keeps a backup and the file mode and recreates the services", %{
+    project: project,
+    dir: dir
+  } do
+    path = Path.join(dir, ".env")
+    File.write!(path, "OLD=1\n")
+    File.chmod!(path, 0o640)
+
+    assert {:ok, output} =
+             Commands.run("env_write", %{"content" => "NEW=2\r\nOTHER=3"}, project)
+
+    assert output =~ "== write .env\nsaved"
+    assert File.read!(path) == "NEW=2\nOTHER=3\n"
+    assert File.read!(path <> ".bak") == "OLD=1\n"
+    assert Bitwise.band(File.stat!(path).mode, 0o777) == 0o640
+    refute File.exists?(path <> ".tmp")
+
+    services = ["gateway", "server", "client", "postgres"]
+
+    assert [["config", "--services"], ["up", "--detach" | ^services], ["restart", "gateway"]] =
+             compose_calls()
+  end
+
+  test "env_write without content changes nothing", %{project: project, dir: dir} do
+    assert {:error, output} = Commands.run("env_write", %{}, project)
+    assert output =~ "== write .env failed\ncontent is required"
+    refute File.exists?(Path.join(dir, ".env"))
+    refute Enum.any?(compose_calls(), &match?(["up" | _], &1))
+  end
+
   test "unknown actions and missing projects are errors" do
     assert {:error, "unknown action: rm"} = Commands.run("rm", %{}, {:error, :nope})
 

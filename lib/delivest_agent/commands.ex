@@ -1,7 +1,7 @@
 defmodule DelivestAgent.Commands do
-  alias DelivestAgent.{Compose, Project, Runner, Status}
+  alias DelivestAgent.{Compose, Env, Project, Runner, Status}
 
-  @actions ~w(status update start stop restart logs)
+  @actions ~w(status update start stop restart logs env_read env_write)
   @max_output 64_000
   @default_tail 200
   @max_tail 2_000
@@ -11,6 +11,8 @@ defmodule DelivestAgent.Commands do
   def run(action, args \\ %{}, project_result \\ Project.discover())
 
   def run("status", _args, project_result), do: {:ok, Status.collect(project_result)}
+
+  def run("env_read", _args, {:ok, %Project{} = project}), do: Env.read(project)
 
   def run(action, args, {:ok, %Project{} = project}) when action in @actions do
     with {:ok, services} <- Compose.services(project) do
@@ -35,6 +37,14 @@ defmodule DelivestAgent.Commands do
       {"docker compose up", fn -> Compose.up(project, services) end},
       {"gateway restart", fn -> restart_gateway(project, services) end},
       {"docker image prune", fn -> prune_images() end}
+    ])
+  end
+
+  defp execute("env_write", args, project, services) do
+    steps([
+      {"write .env", fn -> Env.write(project, args["content"]) end},
+      {"docker compose up", fn -> Compose.up(project, services) end},
+      {"gateway restart", fn -> restart_gateway(project, services) end}
     ])
   end
 
