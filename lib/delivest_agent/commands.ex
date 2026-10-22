@@ -1,7 +1,7 @@
 defmodule DelivestAgent.Commands do
-  alias DelivestAgent.{Compose, Env, Project, Runner, Status}
+  alias DelivestAgent.{Backup, Compose, Env, Project, Runner, Status}
 
-  @actions ~w(status update start stop restart logs env_read env_write)
+  @actions ~w(status update start stop restart logs env_read env_write backup restore)
   @max_output 64_000
   @default_tail 200
   @max_tail 2_000
@@ -48,6 +48,30 @@ defmodule DelivestAgent.Commands do
     ])
   end
 
+  defp execute("backup", args, project, _services) do
+    steps([
+      {"dump database", fn -> Backup.dump(project) end},
+      {"upload to bastion", fn -> Backup.upload(args) end}
+    ])
+  after
+    Backup.cleanup()
+  end
+
+  defp execute("restore", args, project, services) do
+    server = Enum.filter(services, &(&1 == "server"))
+
+    restored =
+      steps([
+        {"download backup", fn -> Backup.download(args) end},
+        {"stop server", fn -> stop(project, server) end},
+        {"restore database", fn -> Backup.restore(project) end}
+      ])
+
+    started = steps([{"start server", fn -> start(project, server) end}])
+    Backup.cleanup()
+    combine(restored, started)
+  end
+
   defp execute("start", _args, project, services), do: Compose.up(project, services)
   defp execute("stop", _args, project, services), do: Compose.stop(project, services)
   defp execute("restart", _args, project, services), do: Compose.restart(project, services)
@@ -61,6 +85,18 @@ defmodule DelivestAgent.Commands do
       true -> {:error, "unknown service: #{service}"}
     end
   end
+
+  defp stop(_project, []), do: {:skip, "no server service"}
+  defp stop(project, services), do: Compose.stop(project, services)
+
+  defp start(_project, []), do: {:skip, "no server service"}
+  defp start(project, services), do: Compose.up(project, services)
+
+  defp combine({:ok, first}, {:ok, second}), do: {:ok, first <> second}
+  defp combine({_, first}, {_, second}), do: {:error, text(first) <> text(second)}
+
+  defp text({_status, output}), do: output
+  defp text(output), do: output
 
   defp steps(steps) do
     Enum.reduce_while(steps, {:ok, ""}, fn {title, fun}, {:ok, log} ->

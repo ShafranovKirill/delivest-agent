@@ -14,6 +14,7 @@ defmodule DelivestAgent.ComposeStub do
       key = key(command, args)
 
       case Map.fetch(overrides, key) do
+        {:ok, fun} when is_function(fun, 2) -> fun.(command, args)
         {:ok, response} -> response
         :error -> default(key, dir)
       end
@@ -23,6 +24,7 @@ defmodule DelivestAgent.ComposeStub do
   def key("docker", ["inspect", "--format", "{{json .Config.Labels}}" | _]), do: :labels
   def key("docker", ["inspect" | _]), do: :revisions
   def key("docker", ["image", "prune" | _]), do: :prune
+  def key("curl", _args), do: :curl
   def key("git", _args), do: :git
   def key("setpriv", _args), do: :git
   def key("df", _args), do: :df

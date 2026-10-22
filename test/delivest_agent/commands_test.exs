@@ -1,7 +1,7 @@
 defmodule DelivestAgent.CommandsTest do
   use ExUnit.Case, async: true
 
-  alias DelivestAgent.{Commands, ComposeStub, FakeRunner, Project}
+  alias DelivestAgent.{Backup, Commands, ComposeStub, FakeRunner, Project}
 
   @moduletag :tmp_dir
 
@@ -142,6 +142,109 @@ defmodule DelivestAgent.CommandsTest do
     assert output =~ "== write .env failed\ncontent is required"
     refute File.exists?(Path.join(dir, ".env"))
     refute Enum.any?(compose_calls(), &match?(["up" | _], &1))
+  end
+
+  defp write_copy(_command, args) do
+    File.mkdir_p!(Backup.dir())
+    File.write!(List.last(args), "PGDMP")
+    {"", 0}
+  end
+
+  defp write_download(_command, args) do
+    ["--output", path | _] = Enum.drop_while(args, &(&1 != "--output"))
+    File.write!(path, "PGDMP")
+    {"", 0}
+  end
+
+  test "backup dumps the database without logs and uploads it", %{dir: dir} do
+    FakeRunner.stub(ComposeStub.runner(self(), dir, %{cp: &write_copy/2}))
+    args = %{"upload_url" => "https://bastion/agent/backups/1", "token" => "secret"}
+
+    assert {:ok, output} = Commands.run("backup", args, Project.discover("agent-container"))
+    assert output =~ "== dump database\ndatabase dump is 5 bytes"
+    assert output =~ "== upload to bastion"
+
+    assert [
+             ["config", "--services"],
+             ["exec", "-T", "postgres", "sh", "-c", script, "sh", "/tmp/delivest-backup.dump"],
+             ["cp", "postgres:/tmp/delivest-backup.dump", _],
+             ["exec", "-T", "postgres", "rm", "-f", _]
+           ] = compose_calls()
+
+    assert script =~ "--exclude-table-data=app_logs"
+    refute File.exists?(Backup.dump_path())
+  end
+
+  test "backup sends the token in a header and not in the url", %{dir: dir} do
+    FakeRunner.stub(ComposeStub.runner(self(), dir, %{cp: &write_copy/2}))
+    args = %{"upload_url" => "https://bastion/agent/backups/1", "token" => "secret"}
+
+    Commands.run("backup", args, Project.discover("agent-container"))
+
+    assert_received {:cmd, "curl", curl}
+    assert "Authorization: Bearer secret" in curl
+    assert List.last(curl) == "https://bastion/agent/backups/1"
+  end
+
+  test "failed upload fails the backup and removes the dump", %{dir: dir} do
+    FakeRunner.stub(
+      ComposeStub.runner(self(), dir, %{cp: &write_copy/2, curl: {"403 Forbidden", 22}})
+    )
+
+    args = %{"upload_url" => "https://bastion/agent/backups/1", "token" => "secret"}
+
+    assert {:error, output} = Commands.run("backup", args, Project.discover("agent-container"))
+    assert output =~ "== upload to bastion failed\n403 Forbidden"
+    refute File.exists?(Backup.dump_path())
+  end
+
+  test "restore stops the server then restores and starts it again", %{dir: dir} do
+    FakeRunner.stub(ComposeStub.runner(self(), dir, %{curl: &write_download/2}))
+    args = %{"download_url" => "https://bastion/agent/backups/1/file", "token" => "secret"}
+
+    assert {:ok, output} = Commands.run("restore", args, Project.discover("agent-container"))
+    assert output =~ "== download backup\ndownloaded 5 bytes"
+    assert output =~ "== start server"
+
+    assert [
+             ["config", "--services"],
+             ["stop", "server"],
+             ["cp", _, "postgres:/tmp/delivest-restore.dump"],
+             ["exec", "-T", "postgres", "sh", "-c", script, "sh", "/tmp/delivest-restore.dump"],
+             ["exec", "-T", "postgres", "rm", "-f", "/tmp/delivest-restore.dump"],
+             ["up", "--detach", "server"]
+           ] = compose_calls()
+
+    assert script =~ "_before_restore"
+    refute File.exists?(Backup.restore_path())
+  end
+
+  test "failed restore still starts the server", %{dir: dir} do
+    FakeRunner.stub(
+      ComposeStub.runner(self(), dir, %{
+        curl: &write_download/2,
+        exec: fn command, args ->
+          send(self(), {:cmd, command, args})
+
+          if "sh" in args,
+            do: {"restore failed, the live database is untouched", 1},
+            else: {"", 0}
+        end
+      })
+    )
+
+    args = %{"download_url" => "https://bastion/agent/backups/1/file", "token" => "secret"}
+
+    assert {:error, output} = Commands.run("restore", args, Project.discover("agent-container"))
+    assert output =~ "== restore database failed\nrestore failed, the live database is untouched"
+    assert output =~ "== start server"
+    assert ["up", "--detach", "server"] = List.last(compose_calls())
+  end
+
+  test "restore without a download url does not stop the server", %{project: project} do
+    assert {:error, output} = Commands.run("restore", %{}, project)
+    assert output =~ "download_url and token are required"
+    refute Enum.any?(compose_calls(), &match?(["stop" | _], &1))
   end
 
   test "unknown actions and missing projects are errors" do
