@@ -1,5 +1,5 @@
 defmodule DelivestAgent.Status do
-  alias DelivestAgent.{Compose, Config, Project, Runner}
+  alias DelivestAgent.{Compose, Config, Metrics, Project, Runner}
 
   @checked_hosts ["api", "site"]
 
@@ -7,7 +7,8 @@ defmodule DelivestAgent.Status do
     base = %{
       "agent_version" => Config.version(),
       "collected_at" => DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
-      "checks" => checks()
+      "checks" => checks(),
+      "metrics" => Metrics.collect()
     }
 
     case project_result do

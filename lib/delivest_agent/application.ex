@@ -5,6 +5,8 @@ defmodule DelivestAgent.Application do
 
   @impl true
   def start(_type, _args) do
+    DelivestAgent.Metrics.init()
+
     children =
       [{Task.Supervisor, name: DelivestAgent.TaskSupervisor}] ++ bastion_children()
 
