@@ -107,6 +107,20 @@ defmodule DelivestAgent.CommandsTest do
     assert status["project"] == "delivest"
   end
 
+  test "status reports the orders that did not reach the crm", %{dir: dir} do
+    order = %{"number" => "A001", "status" => "failed", "error" => "timeout"}
+
+    FakeRunner.stub(ComposeStub.runner(self(), dir, %{exec: {Jason.encode!([order]) <> "\n", 0}}))
+
+    assert {:ok, %{"crm" => [^order]}} =
+             Commands.run("status", %{}, Project.discover("agent-container"))
+
+    FakeRunner.stub(ComposeStub.runner(self(), dir, %{exec: {"psql: error", 2}}))
+
+    assert {:ok, %{"crm" => nil}} =
+             Commands.run("status", %{}, Project.discover("agent-container"))
+  end
+
   test "env_read returns the .env of the project", %{project: project, dir: dir} do
     assert {:ok, ""} = Commands.run("env_read", %{}, project)
 

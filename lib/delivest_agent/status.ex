@@ -1,5 +1,5 @@
 defmodule DelivestAgent.Status do
-  alias DelivestAgent.{Compose, Config, Metrics, Project, Runner}
+  alias DelivestAgent.{Compose, Config, Crm, Metrics, Project, Runner}
 
   @checked_hosts ["api", "site"]
 
@@ -17,7 +17,8 @@ defmodule DelivestAgent.Status do
           "project" => project.name,
           "project_dir" => project.dir,
           "containers" => containers(project),
-          "disk" => disk(project.dir)
+          "disk" => disk(project.dir),
+          "crm" => Crm.problems(project)
         })
 
       {:error, reason} ->
