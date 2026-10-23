@@ -22,9 +22,14 @@ defmodule DelivestAgent.ComposeStub do
   end
 
   def key("docker", ["inspect", "--format", "{{json .Config.Labels}}" | _]), do: :labels
+  def key("docker", ["inspect", "--format", "{{.Config.Image}} {{.Image}}" | _]), do: :images
   def key("docker", ["inspect" | _]), do: :revisions
+  def key("docker", ["tag" | _]), do: :tag
+  def key("docker", ["run" | _]), do: :run
+  def key("docker", ["rm" | _]), do: :rm
   def key("docker", ["image", "prune" | _]), do: :prune
   def key("curl", _args), do: :curl
+  def key("git", ["-C", _dir, "rev-parse" | _]), do: :rev_parse
   def key("git", _args), do: :git
   def key("setpriv", _args), do: :git
   def key("df", _args), do: :df
@@ -59,7 +64,12 @@ defmodule DelivestAgent.ComposeStub do
     {Enum.map_join(lines, "\n", &Jason.encode!/1), 0}
   end
 
-  defp default(:revisions, _dir), do: {"aaa111fullid abc123\n", 0}
+  defp default(:revisions, _dir), do: {"aaa111fullid 3 abc123\nbbb222fullid 0 agent42\n", 0}
+
+  defp default(:images, _dir),
+    do: {"ghcr.io/x/delivest-server:latest sha256:111\npostgres:16-alpine sha256:222\n", 0}
+
+  defp default(:rev_parse, _dir), do: {"0123abc\n", 0}
 
   defp default(:df, _dir),
     do:

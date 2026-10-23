@@ -1,5 +1,5 @@
 defmodule DelivestAgent.Status do
-  alias DelivestAgent.{Compose, Config, Crm, Metrics, Project, Runner}
+  alias DelivestAgent.{Compose, Config, Database, Env, Metrics, Project, Runner}
 
   @checked_hosts ["api", "site"]
 
@@ -13,12 +13,20 @@ defmodule DelivestAgent.Status do
 
     case project_result do
       {:ok, %Project{} = project} ->
+        {containers, agent} = containers_and_agent(project)
+        database = Database.stats(project)
+
         Map.merge(base, %{
           "project" => project.name,
           "project_dir" => project.dir,
-          "containers" => containers(project),
+          "containers" => containers,
+          "agent" => agent,
           "disk" => disk(project.dir),
-          "crm" => Crm.problems(project)
+          "crm" => database["crm"],
+          "orders" => database["orders"],
+          "errors" => database["errors"],
+          "database" => database["size_bytes"] && %{"size_bytes" => database["size_bytes"]},
+          "env" => Env.check(project)
         })
 
       {:error, reason} ->
@@ -26,24 +34,41 @@ defmodule DelivestAgent.Status do
     end
   end
 
-  def containers(project) do
-    case Compose.containers(project) do
-      {:ok, containers} ->
-        revisions = revisions(Enum.map(containers, & &1["ID"]))
+  def containers(project), do: project |> containers_and_agent() |> elem(0)
 
-        Enum.map(containers, fn container ->
-          %{
-            "service" => container["Service"],
-            "state" => container["State"],
-            "health" => blank(container["Health"]),
-            "status" => container["Status"],
-            "image" => container["Image"],
-            "revision" => revisions[container["ID"]]
-          }
-        end)
+  defp containers_and_agent(project) do
+    case Compose.ps(project) do
+      {:ok, all} ->
+        inspected = inspect_containers(Enum.map(all, & &1["ID"]))
+
+        described =
+          Enum.map(all, fn container ->
+            info = inspected[container["ID"]] || %{}
+
+            %{
+              "service" => container["Service"],
+              "state" => container["State"],
+              "health" => blank(container["Health"]),
+              "status" => container["Status"],
+              "image" => container["Image"],
+              "revision" => info[:revision],
+              "restarts" => info[:restarts]
+            }
+          end)
+
+        {agent, containers} =
+          Enum.split_with(described, &(&1["service"] == project.agent_service))
+
+        agent =
+          case agent do
+            [agent | _] -> Map.take(agent, ["image", "revision"])
+            [] -> nil
+          end
+
+        {containers, agent}
 
       {:error, {_status, output}} ->
-        [%{"error" => String.trim(output)}]
+        {[%{"error" => String.trim(output)}], nil}
     end
   end
 
@@ -90,26 +115,38 @@ defmodule DelivestAgent.Status do
     end
   end
 
-  defp revisions([]), do: %{}
+  defp inspect_containers([]), do: %{}
 
-  defp revisions(ids) do
-    format = ~s({{.Id}} {{index .Config.Labels "org.opencontainers.image.revision"}})
+  defp inspect_containers(ids) do
+    format =
+      ~s({{.Id}} {{.RestartCount}} {{index .Config.Labels "org.opencontainers.image.revision"}})
 
     case Runner.cmd("docker", ["inspect", "--format", format | ids]) do
       {output, 0} ->
         output
         |> String.split("\n", trim: true)
         |> Enum.flat_map(fn line ->
-          case String.split(line, " ", parts: 2) do
-            [id, revision] -> Enum.map(ids, &{&1, id, blank(String.trim(revision))})
+          case String.split(line, " ", parts: 3) do
+            [id, restarts, revision] -> [{id, restarts, revision}]
+            [id, restarts] -> [{id, restarts, ""}]
             _ -> []
           end
         end)
-        |> Enum.filter(fn {short, full, _revision} -> String.starts_with?(full, short) end)
-        |> Map.new(fn {short, _full, revision} -> {short, revision} end)
+        |> Enum.flat_map(fn {full, restarts, revision} ->
+          info = %{revision: blank(String.trim(revision)), restarts: integer(restarts)}
+          for short <- ids, String.starts_with?(full, short), do: {short, info}
+        end)
+        |> Map.new()
 
       _ ->
         %{}
+    end
+  end
+
+  defp integer(value) do
+    case Integer.parse(value) do
+      {number, ""} -> number
+      _ -> nil
     end
   end
 

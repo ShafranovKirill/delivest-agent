@@ -13,6 +13,35 @@ defmodule DelivestAgent.Env do
     end
   end
 
+  # Only the names of the variables leave the server, never their values.
+  def check(%Project{dir: dir} = project) do
+    case File.read(Path.join(dir, ".env.example")) do
+      {:ok, example} ->
+        present =
+          case File.read(path(project)) do
+            {:ok, content} -> keys(content)
+            _ -> []
+          end
+
+        %{"missing" => Enum.reject(keys(example), &(&1 in present))}
+
+      _ ->
+        nil
+    end
+  end
+
+  def keys(content) do
+    content
+    |> String.split(["\r\n", "\n"])
+    |> Enum.flat_map(fn line ->
+      case Regex.run(~r/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=/, line) do
+        [_, key] -> [key]
+        nil -> []
+      end
+    end)
+    |> Enum.uniq()
+  end
+
   def write(%Project{}, content) when is_binary(content) and byte_size(content) > @max_size,
     do: {:error, {1, ".env is larger than #{@max_size} bytes"}}
 

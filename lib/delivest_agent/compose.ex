@@ -16,8 +16,14 @@ defmodule DelivestAgent.Compose do
   end
 
   def containers(%Project{} = project) do
+    with {:ok, containers} <- ps(project) do
+      {:ok, Enum.reject(containers, &(&1["Service"] == project.agent_service))}
+    end
+  end
+
+  def ps(%Project{} = project) do
     with {:ok, output} <- run(project, ["ps", "--all", "--format", "json"]) do
-      {:ok, output |> decode_lines() |> Enum.reject(&(&1["Service"] == project.agent_service))}
+      {:ok, decode_lines(output)}
     end
   end
 
