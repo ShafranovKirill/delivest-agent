@@ -1,11 +1,12 @@
 defmodule DelivestAgent.CommandsTest do
-  use ExUnit.Case, async: true
+  use ExUnit.Case, async: false
 
-  alias DelivestAgent.{Backup, Commands, ComposeStub, FakeRunner, Project}
+  alias DelivestAgent.{Backup, Commands, ComposeStub, FakeRunner, Project, Release}
 
   @moduletag :tmp_dir
 
   setup %{tmp_dir: dir} do
+    File.rm(Release.state_path())
     FakeRunner.stub(ComposeStub.runner(self(), dir))
     %{project: Project.discover("agent-container"), dir: dir}
   end
@@ -66,7 +67,114 @@ defmodule DelivestAgent.CommandsTest do
              ["pull" | ^services],
              ["up", "--detach" | ^services],
              ["restart", "gateway"]
-           ] = compose_calls()
+           ] = Enum.reject(compose_calls(), &match?(["ps" | _], &1))
+  end
+
+  test "update remembers the running images and waits for the site", %{project: project} do
+    assert {:ok, output} = Commands.run("update", %{}, project)
+    assert output =~ "== backup before update\nskipped: the bastion did not ask for it"
+    assert output =~ "== remember running images\nremembered 2 images"
+    assert output =~ "== wait until the site answers\nhealthy after"
+
+    assert_received {:cmd, "docker",
+                     ["tag", "sha256:111", "ghcr.io/x/delivest-server:delivest-previous"]}
+
+    assert_received {:cmd, "docker", ["tag", "sha256:222", "postgres:delivest-previous"]}
+    assert %{"at" => _, "git" => nil} = Release.rollback_info()
+  end
+
+  test "update backs up the database first and stops when the backup fails", %{dir: dir} do
+    FakeRunner.stub(ComposeStub.runner(self(), dir, %{cp: &write_copy/2}))
+    args = %{"upload_url" => "https://bastion/agent/backups/1", "token" => "secret"}
+
+    assert {:ok, output} = Commands.run("update", args, Project.discover("agent-container"))
+    assert output =~ "== backup before update\ndatabase dump is 5 bytes, uploaded to the bastion"
+    refute File.exists?(Backup.dump_path())
+
+    FakeRunner.stub(
+      ComposeStub.runner(self(), dir, %{cp: &write_copy/2, curl: {"403 Forbidden", 22}})
+    )
+
+    assert {:error, output} = Commands.run("update", args, Project.discover("agent-container"))
+    assert output =~ "== backup before update failed\n403 Forbidden"
+    refute output =~ "docker compose pull"
+  end
+
+  test "update rolls back when the site does not come up", %{dir: dir} do
+    restarting =
+      Jason.encode!(%{"ID" => "aaa111", "Service" => "server", "State" => "restarting"})
+
+    FakeRunner.stub(ComposeStub.runner(self(), dir, %{ps: {restarting, 0}}))
+
+    assert {:error, output} = Commands.run("update", %{}, Project.discover("agent-container"))
+    assert output =~ "== wait until the site answers failed\nnot healthy after 0 s:"
+    assert output =~ "container server is restarting"
+    assert output =~ "== automatic rollback\n== restore previous images"
+    refute output =~ "docker image prune"
+
+    assert_received {:cmd, "docker",
+                     [
+                       "tag",
+                       "ghcr.io/x/delivest-server:delivest-previous",
+                       "ghcr.io/x/delivest-server:latest"
+                     ]}
+
+    assert [
+             _config,
+             _pull,
+             ["up", "--detach" | _],
+             ["restart", "gateway"],
+             ["up", "--detach" | _],
+             ["restart", "gateway"]
+           ] = Enum.reject(compose_calls(), &match?(["ps" | _], &1))
+  end
+
+  test "rollback needs a previous update and brings back its images", %{project: project} do
+    assert {:error, output} = Commands.run("rollback", %{}, project)
+    assert output =~ "nothing to roll back to"
+
+    assert {:ok, _} = Commands.run("update", %{}, project)
+    compose_calls()
+
+    assert {:ok, output} = Commands.run("rollback", %{}, project)
+    assert output =~ "== restore previous images"
+    assert output =~ "== git reset\nskipped: no git revision was remembered"
+
+    assert [["config", "--services"], ["up", "--detach" | _], ["restart", "gateway"]] =
+             compose_calls()
+  end
+
+  test "agent_update pulls the agent image and recreates it from a helper", %{
+    project: project,
+    dir: dir
+  } do
+    assert {:ok, output} = Commands.run("agent_update", %{}, project)
+
+    assert output =~
+             "== recreate the agent\nthe agent restarts with ghcr.io/x/delivest-agent:latest"
+
+    assert_received {:cmd, "docker",
+                     ["run", "--detach", "--rm", "--name", "delivest_agent_updater" | run]}
+
+    assert ["pull", "agent"] in compose_calls()
+
+    assert "#{dir}:#{dir}" in run
+    assert "PWD=#{dir}" in run
+    assert ["up", "--detach", "--force-recreate", "--no-deps", "agent"] == Enum.take(run, -5)
+  end
+
+  test "status reports the env keys missing from the example", %{project: project, dir: dir} do
+    assert {:ok, %{"env" => nil}} = Commands.run("status", %{}, project)
+
+    File.write!(
+      Path.join(dir, ".env.example"),
+      "# comment\nPHX_HOST=\nNEW_KEY=x\nexport OTHER=1\n"
+    )
+
+    File.write!(Path.join(dir, ".env"), "PHX_HOST=a.example.com\n#NEW_KEY=commented\n")
+
+    assert {:ok, %{"env" => %{"missing" => ["NEW_KEY", "OTHER"]}}} =
+             Commands.run("status", %{}, project)
   end
 
   test "update skips git outside a checkout and stops when pull fails", %{dir: dir} do
@@ -100,24 +208,44 @@ defmodule DelivestAgent.CommandsTest do
   test "status reports containers without the agent with revisions and disk", %{project: project} do
     assert {:ok, status} = Commands.run("status", %{}, project)
 
-    assert [%{"service" => "server", "revision" => "abc123", "health" => nil}] =
+    assert [%{"service" => "server", "revision" => "abc123", "health" => nil, "restarts" => 3}] =
              status["containers"]
+
+    assert status["agent"] == %{
+             "image" => "ghcr.io/x/delivest-agent:latest",
+             "revision" => "agent42"
+           }
 
     assert status["disk"] == %{"total_kb" => 1000, "used_kb" => 400, "free_kb" => 600}
     assert status["project"] == "delivest"
   end
 
-  test "status reports the orders that did not reach the crm", %{dir: dir} do
+  test "status reports crm problems with orders and errors and the database size", %{dir: dir} do
     order = %{"number" => "A001", "status" => "failed", "error" => "timeout"}
+    orders = %{"last_hour" => 0, "usual" => 6.5}
+    errors = %{"last_5m" => 2, "last_hour" => 10, "latest" => []}
 
-    FakeRunner.stub(ComposeStub.runner(self(), dir, %{exec: {Jason.encode!([order]) <> "\n", 0}}))
+    stats =
+      Jason.encode!(%{
+        "crm" => [order],
+        "orders" => orders,
+        "errors" => errors,
+        "size_bytes" => 1024
+      })
 
-    assert {:ok, %{"crm" => [^order]}} =
-             Commands.run("status", %{}, Project.discover("agent-container"))
+    FakeRunner.stub(ComposeStub.runner(self(), dir, %{exec: {stats <> "\n", 0}}))
+
+    assert {:ok,
+            %{
+              "crm" => [^order],
+              "orders" => ^orders,
+              "errors" => ^errors,
+              "database" => %{"size_bytes" => 1024}
+            }} = Commands.run("status", %{}, Project.discover("agent-container"))
 
     FakeRunner.stub(ComposeStub.runner(self(), dir, %{exec: {"psql: error", 2}}))
 
-    assert {:ok, %{"crm" => nil}} =
+    assert {:ok, %{"crm" => nil, "orders" => nil, "database" => nil}} =
              Commands.run("status", %{}, Project.discover("agent-container"))
   end
 

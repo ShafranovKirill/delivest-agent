@@ -1,5 +1,5 @@
 defmodule DelivestAgent.Status do
-  alias DelivestAgent.{Compose, Config, Database, Env, Metrics, Project, Runner}
+  alias DelivestAgent.{Compose, Config, Database, Env, Metrics, Project, Release, Runner}
 
   @checked_hosts ["api", "site"]
 
@@ -26,7 +26,8 @@ defmodule DelivestAgent.Status do
           "orders" => database["orders"],
           "errors" => database["errors"],
           "database" => database["size_bytes"] && %{"size_bytes" => database["size_bytes"]},
-          "env" => Env.check(project)
+          "env" => Env.check(project),
+          "rollback" => Release.rollback_info()
         })
 
       {:error, reason} ->

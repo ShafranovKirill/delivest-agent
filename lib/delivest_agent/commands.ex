@@ -1,7 +1,7 @@
 defmodule DelivestAgent.Commands do
-  alias DelivestAgent.{Backup, Compose, Env, Project, Runner, Status}
+  alias DelivestAgent.{Backup, Compose, Env, Project, Release, Runner, Status}
 
-  @actions ~w(status update start stop restart logs env_read env_write backup restore)
+  @actions ~w(status update rollback agent_update start stop restart logs env_read env_write backup restore)
   @max_output 64_000
   @default_tail 200
   @max_tail 2_000
@@ -30,13 +30,44 @@ defmodule DelivestAgent.Commands do
 
   def run(action, _args, _project_result), do: {:error, "unknown action: #{action}"}
 
-  defp execute("update", _args, project, services) do
+  # A failed pull leaves the site as it was. Once the new containers are up, a site that
+  # does not answer brings back the images it ran before.
+  defp execute("update", args, project, services) do
+    prepared =
+      steps([
+        {"backup before update", fn -> backup_before_update(project, args) end},
+        {"remember running images", fn -> Release.remember(project) end},
+        {"git pull", fn -> git_pull(project.dir) end},
+        {"docker compose pull", fn -> Compose.pull(project, services) end}
+      ])
+
+    with {:ok, log} <- prepared do
+      started =
+        steps([
+          {"docker compose up", fn -> Compose.up(project, services) end},
+          {"gateway restart", fn -> restart_gateway(project, services) end},
+          {"wait until the site answers", fn -> Release.wait_healthy(project) end}
+        ])
+
+      case started do
+        {:ok, started_log} ->
+          {:ok, pruned} = steps([{"docker image prune", fn -> prune_images() end}])
+          {:ok, log <> started_log <> pruned}
+
+        {:error, started_log} ->
+          {_, rollback_log} = rollback(project, services)
+          {:error, log <> started_log <> "== automatic rollback\n" <> rollback_log}
+      end
+    end
+  end
+
+  defp execute("rollback", _args, project, services), do: rollback(project, services)
+
+  defp execute("agent_update", _args, project, _services) do
     steps([
-      {"git pull", fn -> git_pull(project.dir) end},
-      {"docker compose pull", fn -> Compose.pull(project, services) end},
-      {"docker compose up", fn -> Compose.up(project, services) end},
-      {"gateway restart", fn -> restart_gateway(project, services) end},
-      {"docker image prune", fn -> prune_images() end}
+      {"docker compose pull #{project.agent_service}",
+       fn -> Compose.pull(project, [project.agent_service]) end},
+      {"recreate the agent", fn -> Release.start_agent_updater(project) end}
     ])
   end
 
@@ -86,6 +117,32 @@ defmodule DelivestAgent.Commands do
     end
   end
 
+  defp rollback(project, services) do
+    case Release.read_state() do
+      {:ok, state} ->
+        steps([
+          {"restore previous images", fn -> Release.restore_images(state) end},
+          {"git reset", fn -> git_reset(project.dir, state["git"]) end},
+          {"docker compose up", fn -> Compose.up(project, services) end},
+          {"gateway restart", fn -> restart_gateway(project, services) end}
+        ])
+
+      {:error, {_status, reason}} ->
+        {:error, section("rollback failed", reason)}
+    end
+  end
+
+  defp backup_before_update(project, %{"upload_url" => _} = args) do
+    with {:ok, dumped} <- Backup.dump(project),
+         {:ok, _uploaded} <- Backup.upload(args) do
+      {:ok, dumped <> ", uploaded to the bastion"}
+    end
+  after
+    Backup.cleanup()
+  end
+
+  defp backup_before_update(_project, _args), do: {:skip, "the bastion did not ask for it"}
+
   defp stop(_project, []), do: {:skip, "no server service"}
   defp stop(project, services), do: Compose.stop(project, services)
 
@@ -126,6 +183,17 @@ defmodule DelivestAgent.Commands do
       end
     else
       {:skip, "not a git checkout"}
+    end
+  end
+
+  defp git_reset(_dir, nil), do: {:skip, "no git revision was remembered"}
+
+  defp git_reset(dir, sha) do
+    {command, args} = as_owner(dir, ["git", "-C", dir, "reset", "--keep", sha])
+
+    case Runner.cmd(command, args) do
+      {output, 0} -> {:ok, output}
+      {output, _status} -> {:warn, output}
     end
   end
 

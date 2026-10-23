@@ -13,6 +13,8 @@ if config_env() != :test do
     data_dir: System.get_env("AGENT_DATA_DIR", "/data"),
     gateway_url: System.get_env("AGENT_GATEWAY_URL", "http://gateway"),
     heartbeat_ms: String.to_integer(System.get_env("AGENT_HEARTBEAT_SECONDS", "30")) * 1000,
+    health_timeout_ms:
+      String.to_integer(System.get_env("AGENT_UPDATE_HEALTH_SECONDS", "300")) * 1000,
     hosts: %{
       "api" => blank_to_nil.(System.get_env("PHX_HOST")),
       "site" =>

@@ -5,7 +5,7 @@ defmodule DelivestAgent.Bastion do
 
   alias DelivestAgent.{Commands, Config, Identity, Project, Status}
 
-  @command_timeout :timer.minutes(20)
+  @command_timeout :timer.minutes(40)
 
   def start_link(config), do: Slipstream.start_link(__MODULE__, config, name: __MODULE__)
 
