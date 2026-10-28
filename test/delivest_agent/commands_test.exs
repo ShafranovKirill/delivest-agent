@@ -208,12 +208,20 @@ defmodule DelivestAgent.CommandsTest do
   test "status reports containers without the agent with revisions and disk", %{project: project} do
     assert {:ok, status} = Commands.run("status", %{}, project)
 
-    assert [%{"service" => "server", "revision" => "abc123", "health" => nil, "restarts" => 3}] =
-             status["containers"]
+    assert [
+             %{
+               "service" => "server",
+               "revision" => "abc123",
+               "version" => "1.1.0",
+               "health" => nil,
+               "restarts" => 3
+             }
+           ] = status["containers"]
 
     assert status["agent"] == %{
              "image" => "ghcr.io/x/delivest-agent:latest",
-             "revision" => "agent42"
+             "revision" => "agent42",
+             "version" => nil
            }
 
     assert status["disk"] == %{"total_kb" => 1000, "used_kb" => 400, "free_kb" => 600}

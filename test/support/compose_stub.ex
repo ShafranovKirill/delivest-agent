@@ -64,7 +64,8 @@ defmodule DelivestAgent.ComposeStub do
     {Enum.map_join(lines, "\n", &Jason.encode!/1), 0}
   end
 
-  defp default(:revisions, _dir), do: {"aaa111fullid 3 abc123\nbbb222fullid 0 agent42\n", 0}
+  defp default(:revisions, _dir),
+    do: {"aaa111fullid|3|1.1.0|abc123\nbbb222fullid|0|<no value>|agent42\n", 0}
 
   defp default(:images, _dir),
     do: {"ghcr.io/x/delivest-server:latest sha256:111\npostgres:16-alpine sha256:222\n", 0}

@@ -53,6 +53,7 @@ defmodule DelivestAgent.Status do
               "status" => container["Status"],
               "image" => container["Image"],
               "revision" => info[:revision],
+              "version" => info[:version],
               "restarts" => info[:restarts]
             }
           end)
@@ -62,7 +63,7 @@ defmodule DelivestAgent.Status do
 
         agent =
           case agent do
-            [agent | _] -> Map.take(agent, ["image", "revision"])
+            [agent | _] -> Map.take(agent, ["image", "revision", "version"])
             [] -> nil
           end
 
@@ -120,21 +121,27 @@ defmodule DelivestAgent.Status do
 
   defp inspect_containers(ids) do
     format =
-      ~s({{.Id}} {{.RestartCount}} {{index .Config.Labels "org.opencontainers.image.revision"}})
+      ~s({{.Id}}|{{.RestartCount}}|{{index .Config.Labels "org.opencontainers.image.version"}}|{{index .Config.Labels "org.opencontainers.image.revision"}})
 
     case Runner.cmd("docker", ["inspect", "--format", format | ids]) do
       {output, 0} ->
         output
         |> String.split("\n", trim: true)
         |> Enum.flat_map(fn line ->
-          case String.split(line, " ", parts: 3) do
-            [id, restarts, revision] -> [{id, restarts, revision}]
-            [id, restarts] -> [{id, restarts, ""}]
+          case String.split(line, "|", parts: 4) do
+            [id, restarts, version, revision] -> [{id, restarts, version, revision}]
+            [id, restarts, version] -> [{id, restarts, version, ""}]
+            [id, restarts] -> [{id, restarts, "", ""}]
             _ -> []
           end
         end)
-        |> Enum.flat_map(fn {full, restarts, revision} ->
-          info = %{revision: blank(String.trim(revision)), restarts: integer(restarts)}
+        |> Enum.flat_map(fn {full, restarts, version, revision} ->
+          info = %{
+            revision: blank(String.trim(revision)),
+            version: blank(String.trim(version)),
+            restarts: integer(restarts)
+          }
+
           for short <- ids, String.starts_with?(full, short), do: {short, info}
         end)
         |> Map.new()
