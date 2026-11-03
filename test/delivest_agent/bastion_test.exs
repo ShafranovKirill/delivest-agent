@@ -7,14 +7,22 @@ defmodule DelivestAgent.BastionTest do
 
   setup %{tmp_dir: dir} do
     FakeRunner.stub_global(ComposeStub.runner(self(), dir))
+
+    keys = [:data_dir, :bastion_test_mode, :hosts, :gateway_url, FakeRunner]
+    previous = for key <- keys, do: {key, Application.fetch_env(:delivest_agent, key)}
+
     Application.put_env(:delivest_agent, :data_dir, dir)
     Application.put_env(:delivest_agent, :bastion_test_mode, true)
     Application.put_env(:delivest_agent, :hosts, %{"api" => "api.example.com"})
     Application.put_env(:delivest_agent, :gateway_url, "http://127.0.0.1:1")
 
     on_exit(fn ->
-      for key <- [:data_dir, :bastion_test_mode, :hosts, :gateway_url, FakeRunner],
-          do: Application.delete_env(:delivest_agent, key)
+      for {key, value} <- previous do
+        case value do
+          {:ok, value} -> Application.put_env(:delivest_agent, key, value)
+          :error -> Application.delete_env(:delivest_agent, key)
+        end
+      end
     end)
 
     start_supervised!({Bastion, %{url: "wss://bastion.example.com", token: "secret"}})
