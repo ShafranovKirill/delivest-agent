@@ -47,10 +47,14 @@ defmodule DelivestAgent.Release do
   end
 
   def restore_images(%{"images" => images}) do
-    Enum.reduce_while(images, {:ok, ""}, fn %{"ref" => ref}, {:ok, log} ->
-      case Runner.cmd("docker", ["tag", previous_ref(ref), ref]) do
-        {_output, 0} -> {:cont, {:ok, log <> "#{ref} <- #{previous_ref(ref)}\n"}}
-        {output, status} -> {:halt, {:error, {status, log <> output}}}
+    Enum.reduce_while(images, {:ok, ""}, fn %{"ref" => ref} = image, {:ok, log} ->
+      if String.contains?(ref, "@") do
+        keep_local_image(image, log)
+      else
+        case Runner.cmd("docker", ["tag", previous_ref(ref), ref]) do
+          {_output, 0} -> {:cont, {:ok, log <> "#{ref} <- #{previous_ref(ref)}\n"}}
+          {output, status} -> {:halt, {:error, {status, log <> output}}}
+        end
       end
     end)
   end
@@ -60,6 +64,18 @@ defmodule DelivestAgent.Release do
     {path, name} = split_last(ref, "/")
     repo = name |> String.split(":") |> hd()
     path <> repo <> ":" <> @previous_tag
+  end
+
+  # A digest reference cannot be used as a `docker tag` target. The image is kept under
+  # its previous tag by `remember/1`, so all a rollback has to do is confirm the content
+  # is still local before Compose starts it.
+  defp keep_local_image(%{"ref" => ref} = image, log) do
+    reference = image["id"] || ref
+
+    case Runner.cmd("docker", ["image", "inspect", "--format", "{{.Id}}", reference]) do
+      {_output, 0} -> {:cont, {:ok, log <> "#{ref} is still local\n"}}
+      {output, status} -> {:halt, {:error, {status, log <> output}}}
+    end
   end
 
   defp split_last(ref, separator) do

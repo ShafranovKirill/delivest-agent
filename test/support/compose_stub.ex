@@ -24,6 +24,7 @@ defmodule DelivestAgent.ComposeStub do
   def key("docker", ["inspect", "--format", "{{json .Config.Labels}}" | _]), do: :labels
   def key("docker", ["inspect", "--format", "{{.Config.Image}} {{.Image}}" | _]), do: :images
   def key("docker", ["inspect" | _]), do: :revisions
+  def key("docker", ["image", "inspect" | _]), do: :image_inspect
   def key("docker", ["tag" | _]), do: :tag
   def key("docker", ["run" | _]), do: :run
   def key("docker", ["rm" | _]), do: :rm
@@ -35,11 +36,40 @@ defmodule DelivestAgent.ComposeStub do
   def key("df", _args), do: :df
 
   def key("docker", ["compose" | args]) do
-    args |> Enum.drop_while(&(&1 != "-f")) |> Enum.drop(2) |> hd() |> String.to_atom()
+    args =
+      args
+      |> Enum.drop_while(&(&1 != "-f"))
+      |> Enum.drop(2)
+
+    case args do
+      ["config", "--format", "json"] -> :config_json
+      [command | _] -> String.to_atom(command)
+      [] -> :unknown
+    end
   end
 
   defp default(:labels, dir), do: {labels(dir), 0}
+
   defp default(:config, _dir), do: {"gateway\nserver\nclient\npostgres\nagent\n", 0}
+
+  defp default(:config_json, _dir) do
+    gateway_digest = String.duplicate("a", 64)
+    postgres_digest = String.duplicate("b", 64)
+    s3_digest = String.duplicate("c", 64)
+
+    services = %{
+      "gateway" => %{"image" => "nginx:1.28-alpine@sha256:#{gateway_digest}"},
+      "server" => %{"image" => "ghcr.io/x/delivest-server:latest"},
+      "client" => %{"image" => "ghcr.io/x/delivest-client:latest"},
+      "postgres" => %{"image" => "postgres:16-alpine@sha256:#{postgres_digest}"},
+      "s3" => %{"image" => "chrislusf/seaweedfs:4.50@sha256:#{s3_digest}"},
+      "agent" => %{"image" => "ghcr.io/x/delivest-agent:latest"}
+    }
+
+    {Jason.encode!(%{"services" => services}), 0}
+  end
+
+  defp default(:image_inspect, _dir), do: {"sha256:111\n", 0}
 
   defp default(:ps, _dir) do
     lines = [

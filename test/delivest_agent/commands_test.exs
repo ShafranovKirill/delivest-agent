@@ -48,6 +48,8 @@ defmodule DelivestAgent.CommandsTest do
     assert {:ok, output} = Commands.run("update", %{}, project)
     assert output =~ "== git pull\nAlready up to date."
     assert output =~ "== docker image prune"
+    assert output =~ "== pull gateway\nskipped: pinned image nginx:1.28-alpine@sha256:"
+    assert output =~ "== pull server\npulled ghcr.io/x/delivest-server:latest on attempt 1/3"
 
     %{uid: uid} = File.stat!(dir)
     git = ["git", "-C", dir, "pull", "--ff-only"]
@@ -60,14 +62,82 @@ defmodule DelivestAgent.CommandsTest do
            ["--reuid", _, "--regid", _, "--clear-groups", "env", "HOME=/tmp" | ^git]}
         )
 
-    services = ["gateway", "server", "client", "postgres"]
+    services = ["client", "gateway", "postgres", "s3", "server"]
 
     assert [
-             ["config", "--services"],
-             ["pull" | ^services],
-             ["up", "--detach" | ^services],
+             ["config", "--format", "json"],
+             ["config", "--format", "json"],
+             ["pull", "client"],
+             ["pull", "server"],
+             ["up", "--detach", "--pull", "never" | ^services],
              ["restart", "gateway"]
            ] = Enum.reject(compose_calls(), &match?(["ps" | _], &1))
+  end
+
+  test "update pulls a pinned image only when it is missing locally", %{dir: dir} do
+    missing = fn _command, args ->
+      if Enum.any?(args, &String.starts_with?(&1, "postgres:16-alpine@sha256:")) do
+        {"Error response from daemon: No such image", 1}
+      else
+        {"sha256:111\n", 0}
+      end
+    end
+
+    FakeRunner.stub(ComposeStub.runner(self(), dir, %{image_inspect: missing}))
+
+    assert {:ok, output} = Commands.run("update", %{}, Project.discover("agent-container"))
+    assert output =~ "== pull postgres\npulled postgres:16-alpine@sha256:"
+    assert ["pull", "postgres"] in compose_calls()
+  end
+
+  test "update retries a rate-limited image and stops after the last attempt", %{dir: dir} do
+    attempts = :counters.new(1, [])
+
+    pull = fn _command, args ->
+      if "server" in args do
+        :counters.add(attempts, 1, 1)
+        {"429 Too Many Requests", 1}
+      else
+        {"Pulled\n", 0}
+      end
+    end
+
+    FakeRunner.stub(ComposeStub.runner(self(), dir, %{pull: pull}))
+
+    assert {:error, output} =
+             Commands.run("update", %{}, Project.discover("agent-container"))
+
+    assert output =~ "== pull server failed"
+    assert output =~ "attempt 1/3 failed"
+    assert output =~ "attempt 3/3 failed"
+    assert output =~ "retries exhausted: the registry is rate limiting pulls"
+    assert :counters.get(attempts, 1) == 3
+    refute Enum.any?(compose_calls(), &match?(["up" | _], &1))
+  end
+
+  test "update pulls a missing infrastructure image and blocks the start when it fails", %{
+    dir: dir
+  } do
+    missing = fn _command, args ->
+      if Enum.any?(args, &String.starts_with?(&1, "nginx:1.28-alpine@sha256:")) do
+        {"Error response from daemon: No such image", 1}
+      else
+        {"sha256:111\n", 0}
+      end
+    end
+
+    pull = fn _command, args ->
+      if "gateway" in args, do: {"429 Too Many Requests", 1}, else: {"Pulled\n", 0}
+    end
+
+    FakeRunner.stub(ComposeStub.runner(self(), dir, %{image_inspect: missing, pull: pull}))
+
+    assert {:error, output} =
+             Commands.run("update", %{}, Project.discover("agent-container"))
+
+    assert output =~ "== pull gateway failed"
+    assert output =~ "retries exhausted: the registry is rate limiting pulls"
+    refute Enum.any?(compose_calls(), &match?(["up" | _], &1))
   end
 
   test "update remembers the running images and waits for the site", %{project: project} do
@@ -97,7 +167,7 @@ defmodule DelivestAgent.CommandsTest do
 
     assert {:error, output} = Commands.run("update", args, Project.discover("agent-container"))
     assert output =~ "== backup before update failed\n403 Forbidden"
-    refute output =~ "docker compose pull"
+    refute output =~ "== pull client"
   end
 
   test "update rolls back when the site does not come up", %{dir: dir} do
@@ -119,14 +189,17 @@ defmodule DelivestAgent.CommandsTest do
                        "ghcr.io/x/delivest-server:latest"
                      ]}
 
+    calls =
+      Enum.reject(compose_calls(), fn args ->
+        match?(["ps" | _], args) or match?(["pull" | _], args) or match?(["config" | _], args)
+      end)
+
     assert [
-             _config,
-             _pull,
-             ["up", "--detach" | _],
+             ["up", "--detach", "--pull", "never" | _],
              ["restart", "gateway"],
-             ["up", "--detach" | _],
+             ["up", "--detach", "--pull", "never" | _],
              ["restart", "gateway"]
-           ] = Enum.reject(compose_calls(), &match?(["ps" | _], &1))
+           ] = calls
   end
 
   test "rollback needs a previous update and brings back its images", %{project: project} do
@@ -140,8 +213,31 @@ defmodule DelivestAgent.CommandsTest do
     assert output =~ "== restore previous images"
     assert output =~ "== git reset\nskipped: no git revision was remembered"
 
-    assert [["config", "--services"], ["up", "--detach" | _], ["restart", "gateway"]] =
+    assert [
+             ["config", "--format", "json"],
+             ["up", "--detach", "--pull", "never" | _],
+             ["restart", "gateway"]
+           ] =
              compose_calls()
+  end
+
+  test "rollback keeps a digest-pinned image that is still local", %{dir: dir} do
+    digest = String.duplicate("a", 64)
+    ref = "nginx:1.28-alpine@sha256:#{digest}"
+
+    FakeRunner.stub(
+      ComposeStub.runner(self(), dir, %{
+        images: {"ghcr.io/x/delivest-server:latest sha256:111\n#{ref} sha256:333\n", 0}
+      })
+    )
+
+    assert {:ok, _} = Commands.run("update", %{}, Project.discover("agent-container"))
+    compose_calls()
+
+    assert {:ok, output} = Commands.run("rollback", %{}, Project.discover("agent-container"))
+    assert output =~ "#{ref} is still local"
+    assert_received {:cmd, "docker", ["image", "inspect", "--format", "{{.Id}}", "sha256:333"]}
+    refute_received {:cmd, "docker", ["tag", _, ^ref]}
   end
 
   test "agent_update pulls the agent image and recreates it from a helper", %{
@@ -184,7 +280,8 @@ defmodule DelivestAgent.CommandsTest do
              Commands.run("update", %{}, Project.discover("agent-container"))
 
     assert output =~ "skipped: not a git checkout"
-    assert output =~ "== docker compose pull failed\ndenied"
+    assert output =~ "== pull client failed\nattempt 1/3 failed: denied"
+    assert output =~ "not retrying: the error is not a rate limit"
     refute Enum.any?(compose_calls(), &match?(["up" | _], &1))
   end
 
@@ -281,10 +378,13 @@ defmodule DelivestAgent.CommandsTest do
     assert Bitwise.band(File.stat!(path).mode, 0o777) == 0o640
     refute File.exists?(path <> ".tmp")
 
-    services = ["gateway", "server", "client", "postgres"]
+    services = ["client", "gateway", "postgres", "s3", "server"]
 
-    assert [["config", "--services"], ["up", "--detach" | ^services], ["restart", "gateway"]] =
-             compose_calls()
+    assert [
+             ["config", "--format", "json"],
+             ["up", "--detach" | ^services],
+             ["restart", "gateway"]
+           ] = compose_calls()
   end
 
   test "env_write without content changes nothing", %{project: project, dir: dir} do
@@ -315,7 +415,7 @@ defmodule DelivestAgent.CommandsTest do
     assert output =~ "== upload to bastion"
 
     assert [
-             ["config", "--services"],
+             ["config", "--format", "json"],
              ["exec", "-T", "postgres", "sh", "-c", script, "sh", "/tmp/delivest-backup.dump"],
              ["cp", "postgres:/tmp/delivest-backup.dump", _],
              ["exec", "-T", "postgres", "rm", "-f", _]
@@ -357,7 +457,7 @@ defmodule DelivestAgent.CommandsTest do
     assert output =~ "== start server"
 
     assert [
-             ["config", "--services"],
+             ["config", "--format", "json"],
              ["stop", "server"],
              ["cp", _, "postgres:/tmp/delivest-restore.dump"],
              ["exec", "-T", "postgres", "sh", "-c", script, "sh", "/tmp/delivest-restore.dump"],

@@ -32,19 +32,32 @@ defmodule DelivestAgent.Commands do
 
   # A failed pull leaves the site as it was. Once the new containers are up, a site that
   # does not answer brings back the images it ran before.
-  defp execute("update", args, project, services) do
+  defp execute("update", args, project, previous_services) do
     prepared =
-      steps([
-        {"backup before update", fn -> backup_before_update(project, args) end},
-        {"remember running images", fn -> Release.remember(project) end},
-        {"git pull", fn -> git_pull(project.dir) end},
-        {"docker compose pull", fn -> Compose.pull(project, services) end}
-      ])
+      case steps([
+             {"backup before update", fn -> backup_before_update(project, args) end},
+             {"remember running images", fn -> Release.remember(project) end},
+             {"git pull", fn -> git_pull(project.dir) end}
+           ]) do
+        {:ok, log} ->
+          # The compose file may have changed in the pulled revision, so read the service
+          # list and the image references only after git has updated the checkout.
+          with {:ok, definitions} <- Compose.definitions(project),
+               {:ok, pull_log} <- pull_images(project, definitions) do
+            {:ok, log <> pull_log, Enum.map(definitions, & &1.name)}
+          else
+            {:error, {status, output}} -> {:error, {status, log <> output}}
+            {:error, output} when is_binary(output) -> {:error, log <> output}
+          end
 
-    with {:ok, log} <- prepared do
+        error ->
+          error
+      end
+
+    with {:ok, log, services} <- prepared do
       started =
         steps([
-          {"docker compose up", fn -> Compose.up(project, services) end},
+          {"docker compose up", fn -> Compose.up_prepared(project, services) end},
           {"gateway restart", fn -> restart_gateway(project, services) end},
           {"wait until the site answers", fn -> Release.wait_healthy(project) end}
         ])
@@ -55,7 +68,7 @@ defmodule DelivestAgent.Commands do
           {:ok, log <> started_log <> pruned}
 
         {:error, started_log} ->
-          {_, rollback_log} = rollback(project, services)
+          {_, rollback_log} = rollback(project, previous_services)
           {:error, log <> started_log <> "== automatic rollback\n" <> rollback_log}
       end
     end
@@ -123,7 +136,7 @@ defmodule DelivestAgent.Commands do
         steps([
           {"restore previous images", fn -> Release.restore_images(state) end},
           {"git reset", fn -> git_reset(project.dir, state["git"]) end},
-          {"docker compose up", fn -> Compose.up(project, services) end},
+          {"docker compose up", fn -> Compose.up_prepared(project, services) end},
           {"gateway restart", fn -> restart_gateway(project, services) end}
         ])
 
@@ -154,6 +167,14 @@ defmodule DelivestAgent.Commands do
 
   defp text({_status, output}), do: output
   defp text(output), do: output
+
+  defp pull_images(project, definitions) do
+    steps(
+      Enum.map(definitions, fn definition ->
+        {"pull #{definition.name}", fn -> Compose.prepare_image(project, definition) end}
+      end)
+    )
+  end
 
   defp steps(steps) do
     Enum.reduce_while(steps, {:ok, ""}, fn {title, fun}, {:ok, log} ->
