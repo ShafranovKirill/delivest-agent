@@ -79,12 +79,19 @@ defmodule DelivestAgent.Status do
 
     Config.hosts()
     |> Map.take(@checked_hosts)
-    |> Map.new(fn {kind, host} -> {kind, check(gateway, host)} end)
+    |> Map.new(fn {kind, host} -> {kind, check(gateway, host, kind(kind))} end)
   end
 
-  def check(gateway, host) do
+  @doc """
+  Checks one host. Without an explicit kind the site is checked, which keeps the
+  old call sites working.
+  """
+  def check(gateway, host), do: check(gateway, host, :site)
+
+  def check(gateway, host, kind) do
     started = System.monotonic_time(:millisecond)
-    request = {String.to_charlist(gateway <> "/"), [{~c"host", String.to_charlist(host)}]}
+    path = if kind == :api, do: "/ready", else: "/"
+    request = {String.to_charlist(gateway <> path), [{~c"host", String.to_charlist(host)}]}
 
     result =
       case :httpc.request(
@@ -93,8 +100,20 @@ defmodule DelivestAgent.Status do
              [timeout: 5_000, connect_timeout: 3_000, autoredirect: false],
              body_format: :binary
            ) do
-        {:ok, {{_version, status, _reason}, _headers, _body}} ->
-          %{"ok" => status < 500, "status" => status}
+        {:ok, {{_version, status, _reason}, _headers, body}} ->
+          ok = status == 200 and body_ok?(kind, body)
+
+          result =
+            if ok,
+              do: %{"ok" => true, "status" => status},
+              else: %{"ok" => false, "status" => status}
+
+          result =
+            if not ok and status == 200,
+              do: Map.put(result, "error", "not ready"),
+              else: result
+
+          Map.merge(result, details(kind, body))
 
         {:error, reason} ->
           %{"ok" => false, "error" => inspect(reason)}
@@ -102,6 +121,29 @@ defmodule DelivestAgent.Status do
 
     Map.put(result, "ms", System.monotonic_time(:millisecond) - started)
   end
+
+  defp kind("api"), do: :api
+  defp kind(_kind), do: :site
+
+  # The API is ready only when it says so: an HTML error page or a 404 from the
+  # gateway is still an answer, but not a deployed application.
+  defp body_ok?(:api, body) do
+    case Jason.decode(body) do
+      {:ok, %{"status" => "ok"}} -> true
+      _ -> false
+    end
+  end
+
+  defp body_ok?(:site, body), do: String.contains?(body, ~s(id="app"))
+
+  defp details(:api, body) do
+    case Jason.decode(body) do
+      {:ok, %{"version" => version}} when is_binary(version) -> %{"version" => version}
+      _ -> %{}
+    end
+  end
+
+  defp details(_kind, _body), do: %{}
 
   def disk(dir) do
     with {output, 0} <- Runner.cmd("df", ["-Pk", dir]),
