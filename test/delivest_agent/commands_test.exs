@@ -280,7 +280,10 @@ defmodule DelivestAgent.CommandsTest do
              Commands.run("update", %{}, Project.discover("agent-container"))
 
     assert output =~ "skipped: not a git checkout"
-    assert output =~ "== pull client failed\nattempt 1/3 failed: denied"
+
+    assert output =~
+             "== pull client failed\nattempt 1/3 failed: registry ghcr.io, image ghcr.io/x/delivest-client:latest: denied"
+
     assert output =~ "not retrying: the error is not a rate limit"
     refute Enum.any?(compose_calls(), &match?(["up" | _], &1))
   end

@@ -119,7 +119,10 @@ defmodule DelivestAgent.Compose do
         {:ok, log <> "pulled #{image} on attempt #{attempt}/#{attempts}" <> output_note(output)}
 
       {:error, {status, output}} ->
-        failed = log <> "attempt #{attempt}/#{attempts} failed: #{String.trim(output)}\n"
+        failed =
+          log <>
+            "attempt #{attempt}/#{attempts} failed: registry #{registry(image)}, image #{image}: " <>
+            String.trim(output) <> "\n"
 
         case {rate_limited?(output), delays} do
           {true, [delay | rest]} ->
@@ -148,6 +151,21 @@ defmodule DelivestAgent.Compose do
     output
     |> String.downcase()
     |> String.match?(~r/\b429\b|too many requests|toomanyrequests|rate limit/)
+  end
+
+  # Docker Hub is the implicit registry for a short reference such as `nginx:1.28-alpine`.
+  # Making it explicit in the update log helps an operator tell which registry is rate
+  # limiting or unavailable.
+  defp registry(image) do
+    case String.split(image, "/", parts: 2) do
+      [_single] ->
+        "docker.io"
+
+      [first, _rest] ->
+        if first == "localhost" or String.contains?(first, ".") or String.contains?(first, ":"),
+          do: first,
+          else: "docker.io"
+    end
   end
 
   defp output_note(output) do
