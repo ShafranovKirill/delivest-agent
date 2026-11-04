@@ -270,9 +270,62 @@ defmodule DelivestAgent.CommandsTest do
     assert [
              ["up", "--detach", "--pull", "never" | _],
              ["restart", "gateway"],
+             ["stop", "server"],
              ["up", "--detach", "--pull", "never" | _],
              ["restart", "gateway"]
            ] = calls
+  end
+
+  test "automatic rollback refuses a migration committed after the first safety check", %{
+    dir: dir
+  } do
+    File.mkdir!(Path.join(dir, ".git"))
+    reads = :counters.new(1, [])
+
+    migrations = fn _command, _args ->
+      :counters.add(reads, 1, 1)
+
+      if :counters.get(reads, 1) < 3,
+        do: {"20240101000000\n", 0},
+        else: {"20240101000000\n20240201000000\n", 0}
+    end
+
+    FakeRunner.stub(
+      ComposeStub.runner(self(), dir, %{
+        ps: {restarting(), 0},
+        migration_exec: migrations
+      })
+    )
+
+    assert {:error, output} = Commands.run("update", %{}, Project.discover("agent-container"))
+    assert output =~ "== stop target server before rollback"
+    assert output =~ "== recheck database migration safety failed"
+    assert output =~ "database migrations changed"
+    assert :counters.get(reads, 1) == 3
+    refute_received {:cmd, "git", ["-C", ^dir, "reset" | _]}
+
+    calls = compose_calls()
+    assert ["stop", "server"] in calls
+    assert Enum.count(calls, &match?(["up" | _], &1)) == 1
+  end
+
+  test "automatic rollback does not start the old server when the target cannot be stopped", %{
+    dir: dir
+  } do
+    File.mkdir!(Path.join(dir, ".git"))
+
+    FakeRunner.stub(
+      ComposeStub.runner(self(), dir, %{
+        ps: {restarting(), 0},
+        stop: {"could not stop server", 1}
+      })
+    )
+
+    assert {:error, output} = Commands.run("update", %{}, Project.discover("agent-container"))
+    assert output =~ "== stop target server before rollback failed"
+    assert output =~ "could not stop server"
+    refute_received {:cmd, "git", ["-C", ^dir, "reset" | _]}
+    assert Enum.count(compose_calls(), &match?(["up" | _], &1)) == 1
   end
 
   test "a changed migration ledger blocks automatic rollback and remains blocked on retry", %{

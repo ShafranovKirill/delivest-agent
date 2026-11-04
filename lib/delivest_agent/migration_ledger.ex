@@ -1,8 +1,8 @@
 defmodule DelivestAgent.MigrationLedger do
   alias DelivestAgent.{Project, Runner}
 
-  @query "SELECT version FROM schema_migrations ORDER BY version"
-  @script ~S(psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -At -v ON_ERROR_STOP=1 -c "$1")
+  @query "BEGIN; SET LOCAL lock_timeout = '5s'; LOCK TABLE schema_migrations IN SHARE UPDATE EXCLUSIVE MODE; SELECT version FROM schema_migrations ORDER BY version; COMMIT;"
+  @script ~S(psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -qAt -v ON_ERROR_STOP=1 -c "$1")
 
   def versions(%Project{} = project) do
     args = [

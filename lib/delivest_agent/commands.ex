@@ -206,7 +206,7 @@ defmodule DelivestAgent.Commands do
 
       {:error, started_log} ->
         rollback_log =
-          case rollback(project, state["current"], "automatic rollback") do
+          case rollback(project, state["current"], "automatic rollback", true) do
             {:ok, output} -> output
             {:error, {_status, output}} -> output
             {:error, output} -> output
@@ -218,14 +218,14 @@ defmodule DelivestAgent.Commands do
 
   # The rollback reads the Compose file of the release it restores, so a service
   # that was added, removed or renamed between revisions is handled correctly.
-  defp rollback(_project, nil, title),
+  defp rollback(project, release, title, quiesce? \\ false)
+
+  defp rollback(_project, nil, title, _quiesce?),
     do: {:error, {1, section(title <> " failed", "no confirmed release to roll back to")}}
 
-  defp rollback(project, release, title) do
+  defp rollback(project, release, title, quiesce?) do
     with {:ok, schema_log} <-
-           rollback_step("check database migration safety", fn ->
-             Release.guard_rollback(project, release)
-           end),
+           rollback_safety(project, release, quiesce?),
          {:ok, git_log} <-
            rollback_step("git reset", fn -> git_reset(project.dir, release["git"]) end),
          {:ok, definitions, definitions_log} <- rollback_definitions(project),
@@ -256,6 +256,24 @@ defmodule DelivestAgent.Commands do
       end
     else
       {:error, {_status, log}} -> {:error, {1, log}}
+    end
+  end
+
+  defp rollback_safety(project, release, false) do
+    rollback_step("check database migration safety", fn ->
+      Release.guard_rollback(project, release)
+    end)
+  end
+
+  defp rollback_safety(project, release, true) do
+    steps([
+      {"check database migration safety", fn -> Release.guard_rollback(project, release) end},
+      {"stop target server before rollback", fn -> Compose.stop(project, ["server"]) end},
+      {"recheck database migration safety", fn -> Release.guard_rollback(project, release) end}
+    ])
+    |> case do
+      {:ok, log} -> {:ok, log}
+      {:error, log} -> {:error, {1, log}}
     end
   end
 
