@@ -13,7 +13,12 @@ defmodule DelivestAgent.BastionTest do
 
     Application.put_env(:delivest_agent, :data_dir, dir)
     Application.put_env(:delivest_agent, :bastion_test_mode, true)
-    Application.put_env(:delivest_agent, :hosts, %{"api" => "api.example.com"})
+
+    Application.put_env(:delivest_agent, :hosts, %{
+      "api" => "api.example.com",
+      "site" => "site.example.com"
+    })
+
     Application.put_env(:delivest_agent, :gateway_url, "http://127.0.0.1:1")
 
     on_exit(fn ->
@@ -40,14 +45,24 @@ defmodule DelivestAgent.BastionTest do
 
     assert_join(
       ^topic,
-      %{"name" => "api.example.com", "hosts" => %{"api" => "api.example.com"}},
+      %{
+        "name" => "api.example.com",
+        "hosts" => %{"api" => "api.example.com", "site" => "site.example.com"}
+      },
       :ok
     )
 
     assert_push(^topic, "heartbeat", %{
-      "containers" => [%{"service" => "server"}],
+      "containers" => containers,
+      "config_errors" => [],
       "running" => nil
     })
+
+    assert ["client", "gateway", "postgres", "s3", "server"] =
+             containers |> Enum.map(& &1["service"]) |> Enum.sort()
+
+    assert Enum.all?(containers, &is_binary(&1["image_id"]))
+    refute Enum.any?(containers, &(&1["service"] == "agent"))
   end
 
   test "runs a command and reports the result", %{topic: topic} do

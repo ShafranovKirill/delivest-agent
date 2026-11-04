@@ -31,50 +31,57 @@ defmodule DelivestAgent.Commands do
   def run(action, _args, _project_result), do: {:error, "unknown action: #{action}"}
 
   # A failed pull leaves the site as it was. Once the new containers are up, a site that
-  # does not answer brings back the images it ran before.
-  defp execute("update", args, project, previous_services) do
-    prepared =
-      case steps([
-             {"backup before update", fn -> backup_before_update(project, args) end},
-             {"remember running images", fn -> Release.remember(project) end},
-             {"git pull", fn -> git_pull(project.dir) end}
-           ]) do
-        {:ok, log} ->
-          # The compose file may have changed in the pulled revision, so read the service
-          # list and the image references only after git has updated the checkout.
-          with {:ok, definitions} <- Compose.definitions(project),
-               {:ok, pull_log} <- pull_images(project, definitions) do
-            {:ok, log <> pull_log, Enum.map(definitions, & &1.name)}
-          else
-            {:error, {status, output}} -> {:error, {status, log <> output}}
-            {:error, output} when is_binary(output) -> {:error, log <> output}
-          end
+  # does not answer, or answers from an old container, brings back the confirmed
+  # release. The confirmed and previous releases are never overwritten by an attempt.
+  defp execute("update", args, project, _services) do
+    case Release.begin_update(project) do
+      {:ok, state, begin_log} ->
+        case steps([
+               {"backup before update", fn -> backup_before_update(project, args) end},
+               {"git pull", fn -> git_pull(project.dir) end}
+             ]) do
+          {:ok, log} ->
+            case prepare_images(project, state) do
+              {:ok, definitions, pull_log, target} ->
+                start_update(project, state, begin_log <> log <> pull_log, definitions, target)
 
-        error ->
-          error
-      end
+              {:error, prepare_log} ->
+                {:error, begin_log <> log <> prepare_log}
+            end
 
-    with {:ok, log, services} <- prepared do
-      started =
-        steps([
-          {"docker compose up", fn -> Compose.up_prepared(project, services) end},
-          {"gateway restart", fn -> restart_gateway(project, services) end},
-          {"wait until the site answers", fn -> Release.wait_healthy(project) end}
-        ])
+          {:error, log} ->
+            prepare_failed(project, state, begin_log <> log)
 
-      case started do
-        {:ok, started_log} ->
-          {:ok, pruned} = steps([{"docker image prune", fn -> prune_images() end}])
-          {:ok, log <> started_log <> pruned}
+          error ->
+            error
+        end
 
-        {:error, started_log} ->
-          {_, rollback_log} = rollback(project, previous_services)
-          {:error, log <> started_log <> "== automatic rollback\n" <> rollback_log}
-      end
+      {:error, message} ->
+        {:error, message}
     end
   end
 
-  defp execute("rollback", _args, project, services), do: rollback(project, services)
+  defp execute("rollback", _args, project, _services) do
+    case Release.manual_target() do
+      {:ok, release} ->
+        case rollback(project, release, "rollback") do
+          {:ok, log} ->
+            case Release.swap_after_rollback() do
+              :ok ->
+                {:ok, log}
+
+              {:error, message} ->
+                {:ok, log <> "== save the rollback result failed\n" <> message <> "\n"}
+            end
+
+          error ->
+            error
+        end
+
+      {:error, {_status, message}} ->
+        {:error, message}
+    end
+  end
 
   defp execute("agent_update", _args, project, _services) do
     steps([
@@ -130,18 +137,133 @@ defmodule DelivestAgent.Commands do
     end
   end
 
-  defp rollback(project, services) do
-    case Release.read_state() do
-      {:ok, state} ->
+  defp prepare_images(project, state) do
+    case Compose.definitions(project) do
+      {:ok, definitions} ->
+        case pull_images(project, definitions) do
+          {:ok, pull_log} ->
+            case Release.record_attempt(project, definitions) do
+              {:ok, target} ->
+                {:ok, definitions, pull_log, target}
+
+              {:error, message} ->
+                prepare_failed(
+                  project,
+                  state,
+                  "== remember the target release failed\n#{message}\n"
+                )
+            end
+
+          {:error, pull_log} ->
+            prepare_failed(project, state, pull_log)
+        end
+
+      {:error, {_status, output}} ->
+        prepare_failed(project, state, section("read the compose services failed", output))
+    end
+  end
+
+  # A pull that did not finish leaves the checkout on the new revision while the
+  # containers still run the confirmed release. Returning git to the confirmed
+  # revision makes the next attempt start from the same point as a rollback.
+  defp prepare_failed(project, state, log) do
+    git = (state["current"] || %{})["git"]
+
+    case git_reset(project.dir, git) do
+      {:ok, output} -> {:error, log <> section("git reset", output)}
+      {:skip, reason} -> {:error, log <> section("git reset", "skipped: #{reason}")}
+      {:error, {_status, output}} -> {:error, log <> section("git reset failed", output)}
+    end
+  end
+
+  defp start_update(project, state, log, definitions, target) do
+    services = Enum.map(definitions, & &1.name)
+
+    started =
+      steps([
+        {"docker compose up", fn -> Compose.up_prepared(project, services) end},
+        {"gateway restart", fn -> restart_gateway(project, services) end},
+        {"wait until the site answers", fn -> Release.wait_healthy(project, target) end}
+      ])
+
+    case started do
+      {:ok, started_log} ->
+        case Release.confirm(project) do
+          {:ok, confirm_log} ->
+            {:ok, pruned} = steps([{"docker image prune", fn -> prune_images() end}])
+            {:ok, log <> started_log <> section("confirm the release", confirm_log) <> pruned}
+
+          {:error, message} ->
+            {:error, log <> started_log <> section("confirm the release failed", message)}
+        end
+
+      {:error, started_log} ->
+        rollback_log =
+          case rollback(project, state["current"], "automatic rollback") do
+            {:ok, output} -> output
+            {:error, {_status, output}} -> output
+            {:error, output} -> output
+          end
+
+        {:error, log <> started_log <> rollback_log}
+    end
+  end
+
+  # The rollback reads the Compose file of the release it restores, so a service
+  # that was added, removed or renamed between revisions is handled correctly.
+  defp rollback(_project, nil, title),
+    do: {:error, {1, section(title <> " failed", "no confirmed release to roll back to")}}
+
+  defp rollback(project, release, title) do
+    with {:ok, git_log} <-
+           rollback_step("git reset", fn -> git_reset(project.dir, release["git"]) end),
+         {:ok, definitions, definitions_log} <- rollback_definitions(project),
+         {:ok, restore_log} <-
+           rollback_step("restore previous images", fn ->
+             Release.restore(project, release, definitions)
+           end) do
+      services = Enum.map(definitions, & &1.name)
+      target = Release.target(release, definitions)
+
+      result =
         steps([
-          {"restore previous images", fn -> Release.restore_images(state) end},
-          {"git reset", fn -> git_reset(project.dir, state["git"]) end},
           {"docker compose up", fn -> Compose.up_prepared(project, services) end},
-          {"gateway restart", fn -> restart_gateway(project, services) end}
+          {"gateway restart", fn -> restart_gateway(project, services) end},
+          {"wait until the site answers",
+           fn ->
+             Release.wait_healthy(project, target)
+           end}
         ])
 
-      {:error, {_status, reason}} ->
-        {:error, section("rollback failed", reason)}
+      head = section(title, "restored #{release["git"] || release["at"]}")
+      prefix = head <> git_log <> definitions_log <> restore_log
+
+      case result do
+        {:ok, log} -> {:ok, prefix <> log}
+        {:error, {_status, log}} -> {:error, {1, prefix <> log}}
+        {:error, log} when is_binary(log) -> {:error, {1, prefix <> log}}
+      end
+    else
+      {:error, {_status, log}} -> {:error, {1, log}}
+    end
+  end
+
+  defp rollback_definitions(project) do
+    case Compose.definitions(project) do
+      {:ok, definitions} ->
+        names = Enum.map_join(definitions, ", ", & &1.name)
+        {:ok, definitions, section("read the restored compose services", names)}
+
+      {:error, {_status, output}} ->
+        {:error, {1, section("read the restored compose services failed", output)}}
+    end
+  end
+
+  defp rollback_step(title, fun) do
+    case fun.() do
+      {:ok, output} -> {:ok, section(title, output)}
+      {:skip, reason} -> {:ok, section(title, "skipped: #{reason}")}
+      {:error, {_status, output}} -> {:error, {1, section(title <> " failed", output)}}
     end
   end
 
@@ -200,7 +322,7 @@ defmodule DelivestAgent.Commands do
 
       case Runner.cmd(command, args) do
         {output, 0} -> {:ok, output}
-        {output, _status} -> {:warn, output}
+        {output, status} -> {:error, {status, output}}
       end
     else
       {:skip, "not a git checkout"}
@@ -214,7 +336,7 @@ defmodule DelivestAgent.Commands do
 
     case Runner.cmd(command, args) do
       {output, 0} -> {:ok, output}
-      {output, _status} -> {:warn, output}
+      {output, status} -> {:error, {status, output}}
     end
   end
 

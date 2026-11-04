@@ -12,4 +12,19 @@ defmodule DelivestAgent.ReleaseTest do
 
     assert Release.previous_ref("nginx") == "nginx:delivest-previous"
   end
+
+  test "two installations and two releases get different rollback tags" do
+    tag = Release.previous_ref("ghcr.io/x/delivest-server:latest", "shop-a", "abc123-20261104")
+
+    assert tag == "ghcr.io/x/delivest-server:delivest-shop-a-abc123-20261104"
+
+    refute tag ==
+             Release.previous_ref("ghcr.io/x/delivest-server:latest", "shop-b", "abc123-20261104")
+
+    refute tag ==
+             Release.previous_ref("ghcr.io/x/delivest-server:latest", "shop-a", "def456-20261105")
+
+    assert Release.previous_ref("nginx", "shop a", "release/1") ==
+             "nginx:delivest-shop-a-release-1"
+  end
 end

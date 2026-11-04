@@ -8,6 +8,7 @@ defmodule DelivestAgent.Status do
       "agent_version" => Config.version(),
       "collected_at" => DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
       "checks" => checks(),
+      "config_errors" => Config.config_errors(),
       "metrics" => Metrics.collect()
     }
 
@@ -52,6 +53,7 @@ defmodule DelivestAgent.Status do
               "health" => blank(container["Health"]),
               "status" => container["Status"],
               "image" => container["Image"],
+              "image_id" => info[:image_id],
               "revision" => info[:revision],
               "version" => info[:version],
               "restarts" => info[:restarts]
@@ -74,12 +76,21 @@ defmodule DelivestAgent.Status do
     end
   end
 
+  # A required host that is not configured is a configuration error, not an
+  # empty list of checks. The health check must see it and refuse to report a
+  # successful update.
   def checks do
     gateway = Config.get(:gateway_url, "http://gateway")
 
-    Config.hosts()
-    |> Map.take(@checked_hosts)
-    |> Map.new(fn {kind, host} -> {kind, check(gateway, host, kind(kind))} end)
+    Map.new(@checked_hosts, fn kind ->
+      case Config.host(kind) do
+        nil ->
+          {kind, %{"ok" => false, "error" => "#{kind} host is not configured"}}
+
+        host ->
+          {kind, check(gateway, host, kind(kind))}
+      end
+    end)
   end
 
   @doc """
@@ -163,24 +174,35 @@ defmodule DelivestAgent.Status do
 
   defp inspect_containers(ids) do
     format =
-      ~s({{.Id}}|{{.RestartCount}}|{{index .Config.Labels "org.opencontainers.image.version"}}|{{index .Config.Labels "org.opencontainers.image.revision"}})
+      ~s({{.Id}}|{{.RestartCount}}|{{index .Config.Labels "org.opencontainers.image.version"}}|{{index .Config.Labels "org.opencontainers.image.revision"}}|{{.Image}})
 
     case Runner.cmd("docker", ["inspect", "--format", format | ids]) do
       {output, 0} ->
         output
         |> String.split("\n", trim: true)
         |> Enum.flat_map(fn line ->
-          case String.split(line, "|", parts: 4) do
-            [id, restarts, version, revision] -> [{id, restarts, version, revision}]
-            [id, restarts, version] -> [{id, restarts, version, ""}]
-            [id, restarts] -> [{id, restarts, "", ""}]
-            _ -> []
+          case String.split(line, "|", parts: 5) do
+            [id, restarts, version, revision, image_id] ->
+              [{id, restarts, version, revision, image_id}]
+
+            [id, restarts, version, revision] ->
+              [{id, restarts, version, revision, ""}]
+
+            [id, restarts, version] ->
+              [{id, restarts, version, "", ""}]
+
+            [id, restarts] ->
+              [{id, restarts, "", "", ""}]
+
+            _ ->
+              []
           end
         end)
-        |> Enum.flat_map(fn {full, restarts, version, revision} ->
+        |> Enum.flat_map(fn {full, restarts, version, revision, image_id} ->
           info = %{
             revision: blank(String.trim(revision)),
             version: blank(String.trim(version)),
+            image_id: blank(String.trim(image_id)),
             restarts: integer(restarts)
           }
 

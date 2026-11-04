@@ -7,8 +7,68 @@ defmodule DelivestAgent.CommandsTest do
 
   setup %{tmp_dir: dir} do
     File.rm(Release.state_path())
+    File.rm(Release.state_path() <> ".tmp")
     FakeRunner.stub(ComposeStub.runner(self(), dir))
-    %{project: Project.discover("agent-container"), dir: dir}
+
+    gateway = serve_site()
+    previous = Application.fetch_env(:delivest_agent, :hosts)
+    previous_gateway = Application.fetch_env(:delivest_agent, :gateway_url)
+
+    Application.put_env(:delivest_agent, :hosts, %{
+      "api" => "api.example.com",
+      "site" => "site.example.com"
+    })
+
+    Application.put_env(:delivest_agent, :gateway_url, gateway)
+
+    on_exit(fn ->
+      restore_env(:hosts, previous)
+      restore_env(:gateway_url, previous_gateway)
+    end)
+
+    %{project: Project.discover("agent-container"), dir: dir, gateway: gateway}
+  end
+
+  defp restore_env(key, {:ok, value}), do: Application.put_env(:delivest_agent, key, value)
+  defp restore_env(key, :error), do: Application.delete_env(:delivest_agent, key)
+
+  defp serve_site(version \\ "1.1.0") do
+    {:ok, listen} = :gen_tcp.listen(0, [:binary, active: false, reuseaddr: true])
+    {:ok, port} = :inet.port(listen)
+    spawn_link(fn -> accept(listen, version) end)
+    "http://127.0.0.1:#{port}"
+  end
+
+  defp accept(listen, version) do
+    case :gen_tcp.accept(listen) do
+      {:ok, conn} ->
+        {:ok, request} = :gen_tcp.recv(conn, 0, 2_000)
+        {status, body} = response(request, version)
+
+        :gen_tcp.send(
+          conn,
+          "HTTP/1.1 #{status} X\r\ncontent-length: #{byte_size(body)}\r\nconnection: close\r\n\r\n" <>
+            body
+        )
+
+        :gen_tcp.close(conn)
+        accept(listen, version)
+
+      {:error, _reason} ->
+        :ok
+    end
+  end
+
+  defp response(request, version) do
+    if request =~ ~r/^GET \/ready /i do
+      {200, Jason.encode!(%{"status" => "ok", "app" => "delivest", "version" => version})}
+    else
+      {200, ~s(<div id="app"></div>)}
+    end
+  end
+
+  defp restarting do
+    Jason.encode!(%{"ID" => "aaa111", "Service" => "server", "State" => "restarting"})
   end
 
   defp compose_calls do
@@ -67,6 +127,7 @@ defmodule DelivestAgent.CommandsTest do
     assert [
              ["config", "--format", "json"],
              ["config", "--format", "json"],
+             ["config", "--format", "json"],
              ["pull", "client"],
              ["pull", "server"],
              ["up", "--detach", "--pull", "never" | ^services],
@@ -76,10 +137,13 @@ defmodule DelivestAgent.CommandsTest do
 
   test "update pulls a pinned image only when it is missing locally", %{dir: dir} do
     missing = fn _command, args ->
-      if Enum.any?(args, &String.starts_with?(&1, "postgres:16-alpine@sha256:")) do
+      ref = List.last(args)
+      format = args |> Enum.drop_while(&(&1 != "--format")) |> Enum.at(1)
+
+      if format == "{{.Id}}" and String.starts_with?(ref, "postgres:16-alpine@sha256:") do
         {"Error response from daemon: No such image", 1}
       else
-        {"sha256:111\n", 0}
+        ComposeStub.default_response(:image_inspect, dir, args)
       end
     end
 
@@ -119,10 +183,13 @@ defmodule DelivestAgent.CommandsTest do
     dir: dir
   } do
     missing = fn _command, args ->
-      if Enum.any?(args, &String.starts_with?(&1, "nginx:1.28-alpine@sha256:")) do
+      ref = List.last(args)
+      format = args |> Enum.drop_while(&(&1 != "--format")) |> Enum.at(1)
+
+      if format == "{{.Id}}" and String.starts_with?(ref, "nginx:1.28-alpine@sha256:") do
         {"Error response from daemon: No such image", 1}
       else
-        {"sha256:111\n", 0}
+        ComposeStub.default_response(:image_inspect, dir, args)
       end
     end
 
@@ -140,17 +207,25 @@ defmodule DelivestAgent.CommandsTest do
     refute Enum.any?(compose_calls(), &match?(["up" | _], &1))
   end
 
-  test "update remembers the running images and waits for the site", %{project: project} do
+  test "update remembers the running release and waits for the site", %{project: project} do
     assert {:ok, output} = Commands.run("update", %{}, project)
     assert output =~ "== backup before update\nskipped: the bastion did not ask for it"
-    assert output =~ "== remember running images\nremembered 2 images"
+    assert output =~ "remembered release"
+    assert output =~ "as the confirmed release"
     assert output =~ "== wait until the site answers\nhealthy after"
+    assert output =~ "== confirm the release\nconfirmed release"
 
-    assert_received {:cmd, "docker",
-                     ["tag", "sha256:111", "ghcr.io/x/delivest-server:delivest-previous"]}
+    assert_received {:cmd, "docker", ["tag", "sha256:111", tag]}
+    assert tag =~ "ghcr.io/x/delivest-server:delivest-delivest-"
 
-    assert_received {:cmd, "docker", ["tag", "sha256:222", "postgres:delivest-previous"]}
-    assert %{"at" => _, "git" => nil} = Release.rollback_info()
+    assert_received {:cmd, "docker", ["tag", "sha256:222", postgres_tag]}
+    assert postgres_tag =~ "postgres:delivest-delivest-"
+
+    assert %{"at" => _, "git" => nil, "current" => %{"images" => 5}} = Release.rollback_info()
+
+    state = Release.read_state() |> elem(1)
+    assert state["previous"]["images"] != []
+    assert state["attempt"] == nil
   end
 
   test "update backs up the database first and stops when the backup fails", %{dir: dir} do
@@ -177,17 +252,14 @@ defmodule DelivestAgent.CommandsTest do
     FakeRunner.stub(ComposeStub.runner(self(), dir, %{ps: {restarting, 0}}))
 
     assert {:error, output} = Commands.run("update", %{}, Project.discover("agent-container"))
-    assert output =~ "== wait until the site answers failed\nnot healthy after 0 s:"
+    assert output =~ "== wait until the site answers failed\nnot healthy after "
     assert output =~ "container server is restarting"
-    assert output =~ "== automatic rollback\n== restore previous images"
+    assert output =~ "== automatic rollback"
+    assert output =~ "== restore previous images"
     refute output =~ "docker image prune"
 
-    assert_received {:cmd, "docker",
-                     [
-                       "tag",
-                       "ghcr.io/x/delivest-server:delivest-previous",
-                       "ghcr.io/x/delivest-server:latest"
-                     ]}
+    assert_received {:cmd, "docker", ["tag", "sha256:111", tag]}
+    assert tag =~ "ghcr.io/x/delivest-server:delivest-delivest-"
 
     calls =
       Enum.reject(compose_calls(), fn args ->
@@ -215,29 +287,162 @@ defmodule DelivestAgent.CommandsTest do
 
     assert [
              ["config", "--format", "json"],
+             ["config", "--format", "json"],
              ["up", "--detach", "--pull", "never" | _],
              ["restart", "gateway"]
-           ] =
-             compose_calls()
+             | checks
+           ] = compose_calls()
+
+    assert Enum.all?(checks, &match?(["ps" | _], &1))
   end
 
-  test "rollback keeps a digest-pinned image that is still local", %{dir: dir} do
+  test "rollback keeps a digest-pinned image that is still local", %{project: project} do
     digest = String.duplicate("a", 64)
     ref = "nginx:1.28-alpine@sha256:#{digest}"
 
-    FakeRunner.stub(
-      ComposeStub.runner(self(), dir, %{
-        images: {"ghcr.io/x/delivest-server:latest sha256:111\n#{ref} sha256:333\n", 0}
+    assert {:ok, _} = Commands.run("update", %{}, project)
+    compose_calls()
+
+    assert {:ok, output} = Commands.run("rollback", %{}, project)
+    assert output =~ "#{ref} is still local"
+    assert_received {:cmd, "docker", ["image", "inspect", "--format", "{{.Id}}", ^ref]}
+    refute_received {:cmd, "docker", ["tag", _, ^ref]}
+  end
+
+  test "a failed pull keeps the confirmed release for the next attempt", %{dir: dir} do
+    File.mkdir!(Path.join(dir, ".git"))
+
+    pull = fn _command, args ->
+      if "server" in args, do: {"denied", 1}, else: {"Pulled\n", 0}
+    end
+
+    FakeRunner.stub(ComposeStub.runner(self(), dir, %{pull: pull}))
+
+    assert {:error, output} =
+             Commands.run("update", %{}, Project.discover("agent-container"))
+
+    assert output =~ "== pull server failed"
+    assert output =~ "== git reset"
+
+    state = Release.read_state() |> elem(1)
+    assert state["current"]["git"] == "0123abc"
+    assert length(state["current"]["images"]) == 5
+    assert state["previous"] == nil
+    assert state["attempt"] == nil
+
+    FakeRunner.stub(ComposeStub.runner(self(), dir, %{ps: {restarting(), 0}}))
+
+    assert {:error, output} =
+             Commands.run("update", %{}, Project.discover("agent-container"))
+
+    assert output =~ "== automatic rollback\nrestored 0123abc"
+    assert output =~ "== git reset"
+    assert output =~ "== restore previous images"
+
+    assert_received {:cmd, "docker", ["tag", "sha256:111", _tag]}
+    assert Release.rollback_info()["current"]["git"] == "0123abc"
+    assert Release.rollback_info()["current"]["images"] == 5
+  end
+
+  test "rollback refuses a missing saved image before recreating services", %{dir: dir} do
+    assert {:ok, _} = Commands.run("update", %{}, Project.discover("agent-container"))
+    compose_calls()
+
+    missing = fn _command, _args -> {"", 1} end
+
+    FakeRunner.stub(ComposeStub.runner(self(), dir, %{image_inspect: missing}))
+
+    assert {:error, output} =
+             Commands.run("rollback", %{}, Project.discover("agent-container"))
+
+    assert output =~ "== restore previous images failed"
+    assert output =~ "is not local anymore"
+    refute Enum.any?(compose_calls(), &match?(["up" | _], &1))
+  end
+
+  test "an old application that answers 200 blocks a successful update", %{dir: dir} do
+    Application.put_env(:delivest_agent, :gateway_url, serve_site("1.0.0"))
+    FakeRunner.stub(ComposeStub.runner(self(), dir))
+
+    assert {:error, output} =
+             Commands.run("update", %{}, Project.discover("agent-container"))
+
+    assert output =~
+             "api answers version 1.0.0, but the server container runs 1.1.0"
+
+    refute output =~ "== confirm the release"
+    assert Release.rollback_info()["current"]["git"] == nil
+  end
+
+  test "a container with another image id blocks a successful update", %{dir: dir} do
+    revisions = fn _command, _args ->
+      {"aaa111fullid|3|1.1.0|abc123|sha256:999\n" <>
+         "ccc333fullid|0|2.0.0|client42|sha256:444\n" <>
+         "ddd444fullid|0|<no value>|gateway42|sha256:333\n" <>
+         "eee555fullid|0|<no value>|postgres42|sha256:222\n" <>
+         "fff666fullid|0|<no value>|s342|sha256:555\n" <>
+         "bbb222fullid|0|<no value>|agent42|sha256:666\n", 0}
+    end
+
+    FakeRunner.stub(ComposeStub.runner(self(), dir, %{revisions: revisions}))
+
+    assert {:error, output} =
+             Commands.run("update", %{}, Project.discover("agent-container"))
+
+    assert output =~ "container server runs image sha256:999, expected sha256:111"
+    refute output =~ "== confirm the release"
+  end
+
+  test "a corrupt rollback state is reported before anything is changed", %{dir: dir} do
+    File.mkdir_p!(Path.dirname(Release.state_path()))
+    File.write!(Release.state_path(), "{not json")
+
+    FakeRunner.stub(ComposeStub.runner(self(), dir))
+
+    assert {:error, output} =
+             Commands.run("update", %{}, Project.discover("agent-container"))
+
+    assert output =~ "the rollback state is corrupt"
+    refute Enum.any?(compose_calls(), &match?(["up" | _], &1))
+  end
+
+  test "rollback uses the service list of the restored revision", %{dir: dir} do
+    calls = :counters.new(1, [])
+
+    changed =
+      Jason.encode!(%{
+        "services" => %{
+          "gateway" => %{"image" => "nginx:1.28-alpine@sha256:#{String.duplicate("a", 64)}"},
+          "server" => %{"image" => "ghcr.io/x/delivest-server:latest"},
+          "client" => %{"image" => "ghcr.io/x/delivest-client:latest"},
+          "postgres" => %{"image" => "postgres:16-alpine@sha256:#{String.duplicate("b", 64)}"},
+          "worker" => %{"image" => "ghcr.io/x/delivest-server:latest"}
+        }
       })
-    )
+
+    config = fn _command, args ->
+      :counters.add(calls, 1, 1)
+
+      if :counters.get(calls, 1) > 3,
+        do: {changed, 0},
+        else: ComposeStub.default_response(:config_json, dir, args)
+    end
+
+    FakeRunner.stub(ComposeStub.runner(self(), dir, %{config_json: config}))
 
     assert {:ok, _} = Commands.run("update", %{}, Project.discover("agent-container"))
     compose_calls()
 
-    assert {:ok, output} = Commands.run("rollback", %{}, Project.discover("agent-container"))
-    assert output =~ "#{ref} is still local"
-    assert_received {:cmd, "docker", ["image", "inspect", "--format", "{{.Id}}", "sha256:333"]}
-    refute_received {:cmd, "docker", ["tag", _, ^ref]}
+    assert {:error, output} =
+             Commands.run("rollback", %{}, Project.discover("agent-container"))
+
+    assert output =~ "worker"
+    assert output =~ "container worker is not running"
+
+    calls = Enum.reject(compose_calls(), &match?(["config" | _], &1))
+    assert [["up", "--detach", "--pull", "never" | services], ["restart", "gateway"] | _] = calls
+    assert "worker" in services
+    refute "s3" in services
   end
 
   test "agent_update pulls the agent image and recreates it from a helper", %{
@@ -308,21 +513,29 @@ defmodule DelivestAgent.CommandsTest do
   test "status reports containers without the agent with revisions and disk", %{project: project} do
     assert {:ok, status} = Commands.run("status", %{}, project)
 
-    assert [
-             %{
-               "service" => "server",
-               "revision" => "abc123",
-               "version" => "1.1.0",
-               "health" => nil,
-               "restarts" => 3
-             }
-           ] = status["containers"]
+    assert ["client", "gateway", "postgres", "s3", "server"] =
+             status["containers"] |> Enum.map(& &1["service"]) |> Enum.sort()
+
+    assert %{
+             "service" => "server",
+             "state" => "running",
+             "image" => "ghcr.io/x/delivest-server:latest",
+             "image_id" => "sha256:111",
+             "revision" => "abc123",
+             "version" => "1.1.0",
+             "health" => nil,
+             "restarts" => 3
+           } = Enum.find(status["containers"], &(&1["service"] == "server"))
+
+    refute Enum.any?(status["containers"], &(&1["service"] == "agent"))
 
     assert status["agent"] == %{
              "image" => "ghcr.io/x/delivest-agent:latest",
              "revision" => "agent42",
              "version" => nil
            }
+
+    assert status["config_errors"] == []
 
     assert status["disk"] == %{"total_kb" => 1000, "used_kb" => 400, "free_kb" => 600}
     assert status["project"] == "delivest"
