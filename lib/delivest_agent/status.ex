@@ -102,7 +102,9 @@ defmodule DelivestAgent.Status do
   def check(gateway, host, kind) do
     started = System.monotonic_time(:millisecond)
     path = if kind == :api, do: "/ready", else: "/"
-    request = {String.to_charlist(gateway <> path), [{~c"host", String.to_charlist(host)}]}
+    # The internal gateway uses HTTP, behind the proxy that terminates public TLS.
+    headers = [{~c"host", String.to_charlist(host)}, {~c"x-forwarded-proto", ~c"https"}]
+    request = {String.to_charlist(gateway <> path), headers}
 
     result =
       case :httpc.request(

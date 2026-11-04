@@ -413,7 +413,7 @@ defmodule DelivestAgent.Release do
       services = Map.new(containers, &{&1["ID"], &1["Service"]})
 
       format =
-        ~s({{.Id}}|{{.Config.Image}}|{{.Image}}|{{index .Config.Labels "org.opencontainers.image.version"}})
+        ~s({{.Id}}|{{.Config.Image}}|{{.Image}}|{{with index .Config "Labels"}}{{index . "org.opencontainers.image.version"}}{{end}})
 
       case Runner.cmd("docker", ["inspect", "--format", format | ids]) do
         {output, 0} ->
@@ -494,7 +494,8 @@ defmodule DelivestAgent.Release do
   end
 
   defp image_info(ref) do
-    format = ~s({{.Id}}|{{index .Config.Labels "org.opencontainers.image.version"}})
+    format =
+      ~s({{.Id}}|{{with index .Config "Labels"}}{{index . "org.opencontainers.image.version"}}{{end}})
 
     case Runner.cmd("docker", ["image", "inspect", "--format", format, ref]) do
       {output, 0} ->
