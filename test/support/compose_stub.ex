@@ -31,6 +31,8 @@ defmodule DelivestAgent.ComposeStub do
 
   def key("docker", ["inspect" | _]), do: :revisions
   def key("docker", ["image", "inspect" | _]), do: :image_inspect
+  def key("docker", ["ps", "--filter" | _]), do: :migration_container
+  def key("docker", ["exec", "-i" | _]), do: :migration_exec
   def key("docker", ["tag" | _]), do: :tag
   def key("docker", ["run" | _]), do: :run
   def key("docker", ["rm" | _]), do: :rm
@@ -84,6 +86,9 @@ defmodule DelivestAgent.ComposeStub do
 
     {Jason.encode!(%{"services" => services}), 0}
   end
+
+  defp default(:migration_container, _dir, _args), do: {"postgres-container\n", 0}
+  defp default(:migration_exec, _dir, _args), do: {"20240101000000\n", 0}
 
   defp default(:image_inspect, _dir, args) do
     ref = List.last(args)

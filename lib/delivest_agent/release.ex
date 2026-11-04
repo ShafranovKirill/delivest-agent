@@ -13,7 +13,7 @@ defmodule DelivestAgent.Release do
   same names without overwriting each other's rollback tags.
   """
 
-  alias DelivestAgent.{Compose, Config, Project, Runner, Status}
+  alias DelivestAgent.{Compose, Config, MigrationLedger, Project, Runner, Status}
 
   @state_version 2
   @legacy_tag "delivest-previous"
@@ -53,6 +53,7 @@ defmodule DelivestAgent.Release do
   def begin_update(%Project{} = project) do
     with {:ok, state} <- load(),
          {:ok, state, log} <- ensure_current(project, state),
+         {:ok, state} <- ensure_migrations(project, state),
          {:ok, state, log} <- discard_attempt(project, state, log),
          :ok <- save(state) do
       {:ok, state, log}
@@ -93,7 +94,8 @@ defmodule DelivestAgent.Release do
   before the state is written, so a later prune cannot remove them.
   """
   def confirm(%Project{} = project) do
-    with {:ok, state} <- load() do
+    with {:ok, state} <- load(),
+         {:ok, migrations} <- MigrationLedger.versions(project) do
       {attempt, capture_log} =
         case state["attempt"] do
           %{} = attempt ->
@@ -109,7 +111,12 @@ defmodule DelivestAgent.Release do
       key = release_key(attempt)
 
       with {:ok, tagged} <- tag_release(project, attempt["images"], key) do
-        current = attempt |> Map.put("key", key) |> Map.put("images", tagged)
+        current =
+          attempt
+          |> Map.put("key", key)
+          |> Map.put("images", tagged)
+          |> Map.put("migrations", migrations)
+
         state = %{state | "current" => current, "previous" => state["current"], "attempt" => nil}
 
         with :ok <- save(state) do
@@ -134,6 +141,24 @@ defmodule DelivestAgent.Release do
       error -> error
     end
   end
+
+  def guard_rollback(%Project{} = project, %{"migrations" => expected}) when is_list(expected) do
+    case MigrationLedger.versions(project) do
+      {:ok, ^expected} ->
+        {:ok, "applied migrations match the saved release"}
+
+      {:ok, _actual} ->
+        {:error, {1, "database migrations changed; restoring the old server could be unsafe"}}
+
+      {:error, {_status, message}} ->
+        {:error, {1, "rollback safety cannot be verified: #{message}"}}
+    end
+  end
+
+  def guard_rollback(_project, _release),
+    do:
+      {:error,
+       {1, "rollback safety cannot be verified: the saved release has no migration ledger"}}
 
   @doc """
   Makes the release that a successful manual rollback restored the current one,
@@ -348,6 +373,19 @@ defmodule DelivestAgent.Release do
 
         {:ok, state, "remembered #{describe(current)} as the confirmed release\n"}
       end
+    end
+  end
+
+  defp ensure_migrations(_project, %{"current" => %{"migrations" => migrations}} = state)
+       when is_list(migrations),
+       do: {:ok, state}
+
+  defp ensure_migrations(_project, %{"attempt" => %{}}),
+    do: {:error, "cannot establish a safe migration baseline for the unfinished update"}
+
+  defp ensure_migrations(project, state) do
+    with {:ok, migrations} <- MigrationLedger.versions(project) do
+      {:ok, put_in(state, ["current", "migrations"], migrations)}
     end
   end
 

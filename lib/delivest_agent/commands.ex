@@ -14,21 +14,28 @@ defmodule DelivestAgent.Commands do
 
   def run("env_read", _args, {:ok, %Project{} = project}), do: Env.read(project)
 
+  def run("rollback", args, {:ok, %Project{} = project}) do
+    "rollback"
+    |> execute(args, project, [])
+    |> format()
+    |> command_result()
+  end
+
   def run(action, args, {:ok, %Project{} = project}) when action in @actions do
     with {:ok, services} <- Compose.services(project) do
       action |> execute(args, project, services) |> format()
     end
-    |> case do
-      {:ok, output} -> {:ok, output}
-      {:error, {_status, output}} -> {:error, truncate(output)}
-      {:error, output} when is_binary(output) -> {:error, truncate(output)}
-    end
+    |> command_result()
   end
 
   def run(action, _args, {:error, reason}) when action in @actions,
     do: {:error, "compose project is not available: #{inspect(reason)}"}
 
   def run(action, _args, _project_result), do: {:error, "unknown action: #{action}"}
+
+  defp command_result({:ok, output}), do: {:ok, output}
+  defp command_result({:error, {_status, output}}), do: {:error, truncate(output)}
+  defp command_result({:error, output}) when is_binary(output), do: {:error, truncate(output)}
 
   # A failed pull leaves the site as it was. Once the new containers are up, a site that
   # does not answer, or answers from an old container, brings back the confirmed
@@ -215,7 +222,11 @@ defmodule DelivestAgent.Commands do
     do: {:error, {1, section(title <> " failed", "no confirmed release to roll back to")}}
 
   defp rollback(project, release, title) do
-    with {:ok, git_log} <-
+    with {:ok, schema_log} <-
+           rollback_step("check database migration safety", fn ->
+             Release.guard_rollback(project, release)
+           end),
+         {:ok, git_log} <-
            rollback_step("git reset", fn -> git_reset(project.dir, release["git"]) end),
          {:ok, definitions, definitions_log} <- rollback_definitions(project),
          {:ok, restore_log} <-
@@ -236,7 +247,7 @@ defmodule DelivestAgent.Commands do
         ])
 
       head = section(title, "restored #{release["git"] || release["at"]}")
-      prefix = head <> git_log <> definitions_log <> restore_log
+      prefix = head <> schema_log <> git_log <> definitions_log <> restore_log
 
       case result do
         {:ok, log} -> {:ok, prefix <> log}

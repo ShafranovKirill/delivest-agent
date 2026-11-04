@@ -74,7 +74,8 @@ defmodule DelivestAgent.CommandsTest do
   defp compose_calls do
     receive do
       {:cmd, "docker", ["compose" | args]} ->
-        [args |> Enum.drop_while(&(&1 != "-f")) |> Enum.drop(2) | compose_calls()]
+        command = args |> Enum.drop_while(&(&1 != "-f")) |> Enum.drop(2)
+        [command | compose_calls()]
 
       {:cmd, _command, _args} ->
         compose_calls()
@@ -274,6 +275,85 @@ defmodule DelivestAgent.CommandsTest do
            ] = calls
   end
 
+  test "a changed migration ledger blocks automatic rollback and remains blocked on retry", %{
+    dir: dir
+  } do
+    File.mkdir!(Path.join(dir, ".git"))
+    started = :counters.new(1, [])
+
+    restarting =
+      Jason.encode!(%{"ID" => "aaa111", "Service" => "server", "State" => "restarting"})
+
+    up = fn command, args ->
+      :counters.add(started, 1, 1)
+      ComposeStub.default_response(:up, dir, [command | args])
+    end
+
+    migrations = fn _command, _args ->
+      if :counters.get(started, 1) == 0,
+        do: {"20240101000000\n", 0},
+        else: {"20240101000000\n20240201000000\n", 0}
+    end
+
+    FakeRunner.stub(
+      ComposeStub.runner(self(), dir, %{
+        up: up,
+        ps: {restarting, 0},
+        migration_exec: migrations
+      })
+    )
+
+    project = Project.discover("agent-container")
+    assert {:error, first} = Commands.run("update", %{}, project)
+    assert first =~ "database migrations changed"
+    assert :counters.get(started, 1) == 1
+
+    assert Release.read_state() |> elem(1) |> get_in(["current", "migrations"]) == [
+             "20240101000000"
+           ]
+
+    assert {:error, second} = Commands.run("update", %{}, project)
+    assert second =~ "database migrations changed"
+    assert :counters.get(started, 1) == 2
+  end
+
+  test "manual rollback refuses a changed migration ledger before changing git or containers", %{
+    project: project,
+    dir: dir
+  } do
+    File.mkdir!(Path.join(dir, ".git"))
+    assert {:ok, _} = Commands.run("update", %{}, project)
+    compose_calls()
+
+    FakeRunner.stub(
+      ComposeStub.runner(self(), dir, %{
+        migration_exec: {"20240101000000\n20240201000000\n", 0}
+      })
+    )
+
+    assert {:error, output} = Commands.run("rollback", %{}, project)
+    assert output =~ "database migrations changed"
+    refute_received {:cmd, "git", ["-C", ^dir, "reset" | _]}
+    refute Enum.any?(compose_calls(), &match?(["up" | _], &1))
+  end
+
+  test "manual rollback refuses a legacy release with no migration baseline", %{
+    project: project,
+    dir: dir
+  } do
+    assert {:ok, _} = Commands.run("update", %{}, project)
+    compose_calls()
+
+    state = Release.state_path() |> File.read!() |> Jason.decode!()
+    previous = Map.delete(state["previous"], "migrations")
+    File.write!(Release.state_path(), Jason.encode!(%{state | "previous" => previous}))
+
+    assert {:error, output} = Commands.run("rollback", %{}, project)
+    assert output =~ "saved release has no migration ledger"
+    refute_received {:cmd, "git", ["-C", ^dir, "reset" | _]}
+    refute Enum.any?(compose_calls(), &match?(["up" | _], &1))
+  end
+
   test "rollback needs a previous update and brings back its images", %{project: project} do
     assert {:error, output} = Commands.run("rollback", %{}, project)
     assert output =~ "nothing to roll back to"
@@ -286,7 +366,6 @@ defmodule DelivestAgent.CommandsTest do
     assert output =~ "== git reset\nskipped: no git revision was remembered"
 
     assert [
-             ["config", "--format", "json"],
              ["config", "--format", "json"],
              ["up", "--detach", "--pull", "never" | _],
              ["restart", "gateway"]
@@ -307,6 +386,34 @@ defmodule DelivestAgent.CommandsTest do
     assert output =~ "#{ref} is still local"
     assert_received {:cmd, "docker", ["image", "inspect", "--format", "{{.Id}}", ^ref]}
     refute_received {:cmd, "docker", ["tag", _, ^ref]}
+  end
+
+  test "rollback restores the saved compose revision even when the current one is invalid", %{
+    project: project,
+    dir: dir
+  } do
+    File.mkdir!(Path.join(dir, ".git"))
+    assert {:ok, _} = Commands.run("update", %{}, project)
+    compose_calls()
+
+    reset = :counters.new(1, [])
+
+    config = fn _command, args ->
+      if :counters.get(reset, 1) == 0,
+        do: {"invalid compose", 1},
+        else: ComposeStub.default_response(:config_json, dir, args)
+    end
+
+    git = fn command, args ->
+      if "reset" in args, do: :counters.add(reset, 1, 1)
+      ComposeStub.default_response(:git, dir, [command | args])
+    end
+
+    FakeRunner.stub(ComposeStub.runner(self(), dir, %{config_json: config, git: git}))
+
+    assert {:ok, output} = Commands.run("rollback", %{}, project)
+    assert output =~ "== read the restored compose services"
+    assert :counters.get(reset, 1) == 1
   end
 
   test "a failed pull keeps the confirmed release for the next attempt", %{dir: dir} do
