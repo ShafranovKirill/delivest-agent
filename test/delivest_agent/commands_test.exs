@@ -108,7 +108,8 @@ defmodule DelivestAgent.CommandsTest do
 
     assert {:ok, output} = Commands.run("update", %{}, project)
     assert output =~ "== git pull\nAlready up to date."
-    assert output =~ "== docker image prune"
+    refute output =~ "docker image prune"
+    refute_received {:cmd, "docker", ["image", "prune", "--force"]}
     assert output =~ "== pull gateway\nskipped: pinned image nginx:1.28-alpine@sha256:"
     assert output =~ "== pull server\npulled ghcr.io/x/delivest-server:latest on attempt 1/3"
 
@@ -624,6 +625,66 @@ defmodule DelivestAgent.CommandsTest do
     assert ["up", "--detach", "--force-recreate", "--no-deps", "agent"] == Enum.take(run, -5)
   end
 
+  test "agent_update retries a transient containerd commit failure before starting the helper", %{
+    project: project,
+    dir: dir
+  } do
+    attempts = :counters.new(1, [])
+
+    pull = fn _command, _args ->
+      :counters.add(attempts, 1, 1)
+
+      if :counters.get(attempts, 1) == 1,
+        do: {content_store_error(), 1},
+        else: {"Pulled", 0}
+    end
+
+    FakeRunner.stub(ComposeStub.runner(self(), dir, %{pull: pull}))
+
+    assert {:ok, output} = Commands.run("agent_update", %{}, project)
+    assert output =~ "retrying containerd content-store commit failed in 0 ms"
+    assert output =~ "pulled service agent on attempt 2/3"
+    assert :counters.get(attempts, 1) == 2
+    assert_received {:cmd, "docker", ["run" | _]}
+  end
+
+  test "agent_update leaves the old agent running when transient pulls are exhausted", %{
+    project: project,
+    dir: dir
+  } do
+    FakeRunner.stub(ComposeStub.runner(self(), dir, %{pull: {content_store_error(), 1}}))
+
+    assert {:error, output} = Commands.run("agent_update", %{}, project)
+    assert output =~ "attempt 3/3 failed"
+    assert output =~ "retries exhausted: containerd content-store commit failed"
+    assert Enum.count(compose_calls(), &match?(["pull", "agent"], &1)) == 3
+    refute_received {:cmd, "docker", ["run" | _]}
+    refute_received {:cmd, "docker", ["rm" | _]}
+  end
+
+  test "agent_update does not retry unrelated missing files or start the helper", %{
+    project: project,
+    dir: dir
+  } do
+    FakeRunner.stub(
+      ComposeStub.runner(self(), dir, %{pull: {"open /tmp/config: no such file or directory", 1}})
+    )
+
+    assert {:error, output} = Commands.run("agent_update", %{}, project)
+    assert output =~ "not retrying: the error is not a recognized transient pull failure"
+    assert Enum.count(compose_calls(), &match?(["pull", "agent"], &1)) == 1
+    refute_received {:cmd, "docker", ["run" | _]}
+  end
+
+  defp content_store_error do
+    digest = String.duplicate("a", 64)
+
+    "failed commit on ref \"layer-sha256:#{digest}\": commit failed: rename " <>
+      "/var/lib/containerd/io.containerd.content.v1.content/ingest/abc/data " <>
+      "/var/lib/containerd/io.containerd.content.v1.content/blobs/sha256/#{digest}: " <>
+      "no such file or directory"
+  end
+
   test "status reports the env keys missing from the example", %{project: project, dir: dir} do
     assert {:ok, %{"env" => nil}} = Commands.run("status", %{}, project)
 
@@ -649,7 +710,7 @@ defmodule DelivestAgent.CommandsTest do
     assert output =~
              "== pull client failed\nattempt 1/3 failed: registry ghcr.io, image ghcr.io/x/delivest-client:latest: denied"
 
-    assert output =~ "not retrying: the error is not a rate limit"
+    assert output =~ "not retrying: the error is not a recognized transient pull failure"
     refute Enum.any?(compose_calls(), &match?(["up" | _], &1))
   end
 
