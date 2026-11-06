@@ -3,6 +3,7 @@ defmodule DelivestAgent.FullBackup do
 
   alias DelivestAgent.{Compose, OperationLock, Project, Runner}
   alias DelivestAgent.FullBackup.Archive
+  alias DelivestAgent.FullBackup.Storage
 
   @version 1
   @postgres "postgres"
@@ -93,6 +94,7 @@ defmodule DelivestAgent.FullBackup do
          {:ok, context} <- context(project, opts),
          :ok <- compatible?(project, context, manifest),
          :ok <- extract_storage(work),
+         :ok <- Storage.prepare(work),
          {:ok, staged} <- stage_database(project, context, work, id) do
       outcome =
         try do

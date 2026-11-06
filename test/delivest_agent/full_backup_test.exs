@@ -3,6 +3,7 @@ defmodule DelivestAgent.FullBackupTest do
 
   alias DelivestAgent.{FakeRunner, FullBackup, OperationLock, Project}
   alias DelivestAgent.FullBackup.Archive
+  alias DelivestAgent.FullBackup.Storage
 
   setup do
     dir = Path.join(System.tmp_dir!(), "full-backup-test-#{System.unique_integer([:positive])}")
@@ -165,6 +166,55 @@ defmodule DelivestAgent.FullBackupTest do
     assert collect_calls([]) == []
   end
 
+  test "restore staging removes only stale Raft membership and preserves mirror and data", %{
+    dir: dir
+  } do
+    data = Path.join(dir, "data")
+    master = Path.join(data, "m9333")
+    File.mkdir_p!(master)
+    mirror = ~s({"maxVolumeId":8,"topologyId":"old-topology","growthFrozen":false})
+    File.write!(Path.join(master, "max_volume_id"), mirror)
+
+    for name <- ~w(log conf snapshot state) do
+      File.mkdir!(Path.join(master, name))
+      File.write!(Path.join([master, name, "old-ip"]), "127.0.0.1")
+    end
+
+    File.write!(Path.join(data, ".hidden"), "hidden")
+    File.mkdir!(Path.join(data, "filer"))
+    File.write!(Path.join(data, "filer/meta"), "metadata")
+    File.write!(Path.join(data, "1.dat"), "volume")
+
+    assert :ok = Storage.prepare(dir)
+    assert File.read!(Path.join(master, "max_volume_id")) == mirror
+    assert File.read!(Path.join(data, ".hidden")) == "hidden"
+    assert File.read!(Path.join(data, "filer/meta")) == "metadata"
+    assert File.read!(Path.join(data, "1.dat")) == "volume"
+
+    for name <- ~w(log conf snapshot state) do
+      refute File.exists?(Path.join(master, name))
+    end
+  end
+
+  test "incomplete master mirror aborts import before service stop", %{dir: dir, project: project} do
+    fake_docker(self())
+    archive = make_archive(dir, mirror: ~s({"maxVolumeId":8}))
+    assert {:error, {1, message}} = FullBackup.import(project, archive, replace: true)
+    assert message =~ "master mirror"
+    refute Enum.any?(collect_calls([]), &Enum.member?(&1, "stop"))
+  end
+
+  test "missing master mirror with volume data aborts before service stop", %{
+    dir: dir,
+    project: project
+  } do
+    fake_docker(self())
+    archive = make_archive(dir, mirror: :missing)
+    assert {:error, {1, message}} = FullBackup.import(project, archive, replace: true)
+    assert message =~ "master mirror"
+    refute Enum.any?(collect_calls([]), &Enum.member?(&1, "stop"))
+  end
+
   test "pg_restore failure does not stop application", %{dir: dir, project: project} do
     fake_docker(self(), fail_restore: true)
     assert {:error, _} = FullBackup.import(project, make_archive(dir), replace: true)
@@ -200,7 +250,10 @@ defmodule DelivestAgent.FullBackupTest do
 
   test "failed DB transaction restores storage and resumes app", %{dir: dir, project: project} do
     fake_docker(self(), fail_swap: true, swap_state: "uncommitted")
-    assert {:error, {1, _}} = FullBackup.import(project, make_archive(dir), replace: true)
+    archive = make_archive(dir)
+    assert {:ok, original} = Archive.digest(archive)
+    assert {:error, {1, _}} = FullBackup.import(project, archive, replace: true)
+    assert {:ok, ^original} = Archive.digest(archive)
     calls = collect_calls([])
     assert Enum.count(calls, &storage_install_call?/1) == 2
     assert Enum.any?(calls, &(Enum.take(&1, -2) == ["start", "server"]))
@@ -225,6 +278,22 @@ defmodule DelivestAgent.FullBackupTest do
     File.mkdir!(source)
     File.mkdir!(Path.join(source, "data"))
     File.write!(Path.join(source, "data/.hidden"), "hidden")
+    master = Path.join(source, "data/m9333")
+    File.mkdir!(master)
+
+    if opts[:mirror] != :missing do
+      File.write!(
+        Path.join(master, "max_volume_id"),
+        opts[:mirror] || ~s({"maxVolumeId":8,"topologyId":"source-topology","growthFrozen":false})
+      )
+    end
+
+    for name <- ~w(log conf snapshot state) do
+      File.mkdir!(Path.join(master, name))
+      File.write!(Path.join([master, name, "old-ip"]), "127.0.0.1")
+    end
+
+    File.write!(Path.join(source, "data/1.dat"), "volume")
     File.write!(Path.join(source, "database.dump"), "PGDMP")
     storage = Path.join(source, "storage.tar")
     assert {_, 0} = System.cmd("tar", ["--format=gnu", "-C", source, "-cf", storage, "data"])
@@ -313,6 +382,13 @@ defmodule DelivestAgent.FullBackupTest do
             String.starts_with?(from, "s3-id:") ->
               File.mkdir_p!(to)
               File.write!(Path.join(to, ".hidden"), "private")
+              File.mkdir_p!(Path.join(to, "m9333"))
+
+              File.write!(
+                Path.join(to, "m9333/max_volume_id"),
+                ~s({"maxVolumeId":8,"topologyId":"source-topology","growthFrozen":false})
+              )
+
               {"", 0}
 
             true ->
