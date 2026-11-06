@@ -35,6 +35,7 @@ defmodule DelivestAgent.StatusTest do
     assert_received {:request, request}
     assert request =~ ~r/^GET \/ready /i
     assert request =~ ~r/\r\nhost: api\.example\.com\r\n/i
+    assert request =~ ~r/\r\nx-forwarded-proto: https\r\n/i
   end
 
   test "a 404 or an error page is not a ready API" do
