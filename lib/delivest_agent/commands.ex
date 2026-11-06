@@ -114,7 +114,7 @@ defmodule DelivestAgent.Commands do
   defp execute("agent_update", _args, project, _services) do
     steps([
       {"docker compose pull #{project.agent_service}",
-       fn -> Compose.pull(project, [project.agent_service]) end},
+       fn -> Compose.pull_with_retry(project, project.agent_service, nil) end},
       {"recreate the agent", fn -> Release.start_agent_updater(project) end}
     ])
   end
@@ -316,8 +316,7 @@ defmodule DelivestAgent.Commands do
       {:ok, started_log} ->
         case Release.confirm(project) do
           {:ok, confirm_log} ->
-            {:ok, pruned} = steps([{"docker image prune", fn -> prune_images() end}])
-            {:ok, log <> started_log <> section("confirm the release", confirm_log) <> pruned}
+            {:ok, log <> started_log <> section("confirm the release", confirm_log)}
 
           {:error, message} ->
             {:error, log <> started_log <> section("confirm the release failed", message)}
@@ -504,13 +503,6 @@ defmodule DelivestAgent.Commands do
     if "gateway" in services,
       do: Compose.restart(project, ["gateway"]),
       else: {:skip, "no gateway service"}
-  end
-
-  defp prune_images do
-    case Runner.cmd("docker", ["image", "prune", "--force"]) do
-      {output, 0} -> {:ok, output}
-      {output, _status} -> {:warn, output}
-    end
   end
 
   defp section(title, output), do: "== #{title}\n#{String.trim(output)}\n"
