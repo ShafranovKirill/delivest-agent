@@ -44,7 +44,7 @@ defmodule DelivestAgent.Compose do
 
   def ps(%Project{} = project) do
     with {:ok, output} <- run(project, ["ps", "--all", "--format", "json"]) do
-      {:ok, decode_lines(output)}
+      decode_lines(output)
     end
   end
 
@@ -176,11 +176,52 @@ defmodule DelivestAgent.Compose do
   end
 
   defp decode_lines(output) do
-    output
-    |> String.trim()
-    |> case do
-      "[" <> _ = array -> Jason.decode!(array)
-      lines -> lines |> String.split("\n", trim: true) |> Enum.map(&Jason.decode!/1)
+    lines =
+      output
+      |> String.split("\n")
+      |> Enum.map(&String.trim/1)
+      |> Enum.reject(&(&1 == ""))
+      |> Enum.drop_while(&compose_warning?/1)
+      |> Enum.reverse()
+      |> Enum.drop_while(&compose_warning?/1)
+      |> Enum.reverse()
+
+    case lines do
+      [] -> {:ok, []}
+      ["[" <> _ | _] -> decode_array(Enum.join(lines, "\n"))
+      _ -> decode_ndjson(lines)
     end
   end
+
+  defp decode_array(json) do
+    case Jason.decode(json) do
+      {:ok, containers} when is_list(containers) ->
+        if Enum.all?(containers, &is_map/1), do: {:ok, containers}, else: invalid_ps()
+
+      _ ->
+        invalid_ps()
+    end
+  end
+
+  defp decode_ndjson(lines) do
+    Enum.reduce_while(lines, {:ok, []}, fn line, {:ok, containers} ->
+      case Jason.decode(line) do
+        {:ok, container} when is_map(container) -> {:cont, {:ok, [container | containers]}}
+        _ -> {:halt, invalid_ps()}
+      end
+    end)
+    |> case do
+      {:ok, containers} -> {:ok, Enum.reverse(containers)}
+      error -> error
+    end
+  end
+
+  defp compose_warning?(line) do
+    String.match?(
+      line,
+      ~r/^(?:time="[^"]*"\s+level=warn(?:ing)?\b|WARN(?:ING)?(?:\[\d+\]|:)\s|WARNING:\s)/i
+    )
+  end
+
+  defp invalid_ps, do: {:error, {1, "cannot read docker compose ps JSON"}}
 end
