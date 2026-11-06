@@ -1,7 +1,17 @@
 defmodule DelivestAgent.Commands do
-  alias DelivestAgent.{Backup, Compose, Env, Project, Release, Runner, Status}
+  alias DelivestAgent.{
+    Backup,
+    Compose,
+    Env,
+    FullBackup,
+    OperationLock,
+    Project,
+    Release,
+    Runner,
+    Status
+  }
 
-  @actions ~w(status update rollback agent_update start stop restart logs env_read env_write backup restore)
+  @actions ~w(status update rollback agent_update start stop restart logs env_read env_write backup restore full_backup full_restore)
   @max_output 64_000
   @default_tail 200
   @max_tail 2_000
@@ -15,17 +25,28 @@ defmodule DelivestAgent.Commands do
   def run("env_read", _args, {:ok, %Project{} = project}), do: Env.read(project)
 
   def run("rollback", args, {:ok, %Project{} = project}) do
-    "rollback"
-    |> execute(args, project, [])
-    |> format()
+    OperationLock.with_lock(project, fn ->
+      "rollback"
+      |> execute(args, project, [])
+      |> format()
+      |> command_result()
+    end)
     |> command_result()
   end
 
   def run(action, args, {:ok, %Project{} = project}) when action in @actions do
-    with {:ok, services} <- Compose.services(project) do
-      action |> execute(args, project, services) |> format()
+    operation = fn ->
+      with {:ok, services} <- Compose.services(project) do
+        action |> execute(args, project, services) |> format()
+      end
+      |> command_result()
     end
-    |> command_result()
+
+    if action in ~w(status logs) do
+      operation.()
+    else
+      OperationLock.with_lock(project, operation) |> command_result()
+    end
   end
 
   def run(action, _args, {:error, reason}) when action in @actions,
@@ -115,6 +136,14 @@ defmodule DelivestAgent.Commands do
     Backup.cleanup()
   end
 
+  defp execute("full_backup", args, project, _services) do
+    full_transfer(:export, args, project)
+  end
+
+  defp execute("full_restore", args, project, _services) do
+    full_transfer(:import, args, project)
+  end
+
   defp execute("restore", args, project, services) do
     server = Enum.filter(services, &(&1 == "server"))
 
@@ -141,6 +170,96 @@ defmodule DelivestAgent.Commands do
       service in [nil, ""] -> Compose.logs(project, services, tail(args["tail"]))
       service in services -> Compose.logs(project, [service], tail(args["tail"]))
       true -> {:error, "unknown service: #{service}"}
+    end
+  end
+
+  defp full_transfer(kind, args, project) do
+    key = if kind == :export, do: "upload_url", else: "download_url"
+
+    cond do
+      not is_binary(args[key]) or not is_binary(args["token"]) ->
+        {:error, {1, "#{key} and token are required"}}
+
+      URI.parse(args[key]).scheme not in ["http", "https"] ->
+        {:error, {1, "#{key} must be an HTTP or HTTPS URL"}}
+
+      kind == :import and args["replace"] != true ->
+        {:error, {1, "full restore requires replace=true"}}
+
+      true ->
+        dir =
+          Path.join(System.tmp_dir!(), "delivest-transfer-#{System.unique_integer([:positive])}")
+
+        File.mkdir!(dir)
+        File.chmod!(dir, 0o700)
+        durable = kind == :export and args["leave_stopped"] == true
+
+        path =
+          if durable,
+            do:
+              Path.join(
+                project.dir,
+                ".delivest-full-#{:crypto.strong_rand_bytes(8) |> Base.encode16(case: :lower)}.tar"
+              ),
+            else: Path.join(dir, "full-backup.tar")
+
+        try do
+          case kind do
+            :export ->
+              with {:ok, _} <-
+                     FullBackup.export(project, path,
+                       app_stopped: args["app_stopped"] == true,
+                       leave_stopped: args["leave_stopped"] == true
+                     ),
+                   {:ok, _} <-
+                     transfer_curl(
+                       ["--request", "PUT", "--upload-file", path, "--url", args[key]],
+                       args["token"]
+                     ) do
+                if durable, do: File.rm(path)
+                {:ok, "full backup uploaded"}
+              else
+                {:error, {status, message}} = error ->
+                  if durable and File.exists?(path),
+                    do:
+                      {:error,
+                       {status,
+                        message <> "; source remains stopped; local archive retained at #{path}"}},
+                    else: error
+              end
+
+            :import ->
+              with {:ok, _} <-
+                     transfer_curl(["--output", path, "--url", args[key]], args["token"]),
+                   {:ok, message} <-
+                     FullBackup.import(project, path,
+                       replace: true,
+                       app_stopped: args["app_stopped"] == true
+                     ) do
+                {:ok, message}
+              end
+          end
+        after
+          File.rm_rf(dir)
+        end
+    end
+  end
+
+  defp transfer_curl(args, token) do
+    case Runner.cmd(
+           "curl",
+           [
+             "--fail-with-body",
+             "--silent",
+             "--show-error",
+             "--header",
+             "Authorization: Bearer " <> token,
+             "--header",
+             "Expect:"
+           ] ++ args
+         ) do
+      {output, 0} -> {:ok, output}
+      {output, status} -> {:error, {status, output}}
     end
   end
 
