@@ -106,7 +106,7 @@ defmodule DelivestAgent.Compose do
     end
   end
 
-  defp pull_with_retry(project, name, image) do
+  def pull_with_retry(project, name, image) do
     delays = Config.get(:pull_retry_delays_ms, @default_pull_retry_delays_ms)
     attempts = length(delays) + 1
 
@@ -116,16 +116,24 @@ defmodule DelivestAgent.Compose do
   defp pull_attempt(project, name, image, delays, attempt, attempts, log) do
     case pull(project, [name]) do
       {:ok, output} ->
-        {:ok, log <> "pulled #{image} on attempt #{attempt}/#{attempts}" <> output_note(output)}
+        target = if is_binary(image), do: image, else: "service #{name}"
+        {:ok, log <> "pulled #{target} on attempt #{attempt}/#{attempts}" <> output_note(output)}
 
       {:error, {status, output}} ->
+        target =
+          if is_binary(image),
+            do: "registry #{registry(image)}, image #{image}",
+            else: "service #{name}"
+
         failed =
           log <>
-            "attempt #{attempt}/#{attempts} failed: registry #{registry(image)}, image #{image}: " <>
+            "attempt #{attempt}/#{attempts} failed: #{target}: " <>
             String.trim(output) <> "\n"
 
-        case {rate_limited?(output), delays} do
-          {true, [delay | rest]} ->
+        reason = retry_reason(output)
+
+        case {reason, delays} do
+          {reason, [delay | rest]} when reason in [:rate_limit, :content_store] ->
             Process.sleep(delay)
 
             pull_attempt(
@@ -135,14 +143,16 @@ defmodule DelivestAgent.Compose do
               rest,
               attempt + 1,
               attempts,
-              failed <> "retrying in #{delay} ms\n"
+              failed <> "retrying #{retry_label(reason)} in #{delay} ms\n"
             )
 
-          {true, []} ->
-            {:error, {status, failed <> "retries exhausted: the registry is rate limiting pulls"}}
+          {reason, []} when reason in [:rate_limit, :content_store] ->
+            {:error, {status, failed <> "retries exhausted: #{retry_label(reason)}"}}
 
-          {false, _delays} ->
-            {:error, {status, failed <> "not retrying: the error is not a rate limit"}}
+          {nil, _delays} ->
+            {:error,
+             {status,
+              failed <> "not retrying: the error is not a recognized transient pull failure"}}
         end
     end
   end
@@ -152,6 +162,24 @@ defmodule DelivestAgent.Compose do
     |> String.downcase()
     |> String.match?(~r/\b429\b|too many requests|toomanyrequests|rate limit/)
   end
+
+  defp retry_reason(output) do
+    cond do
+      rate_limited?(output) -> :rate_limit
+      content_store_commit_failed?(output) -> :content_store
+      true -> nil
+    end
+  end
+
+  defp content_store_commit_failed?(output) do
+    String.match?(
+      output,
+      ~r/failed commit on ref "layer-sha256:[0-9a-f]+"[\s\S]*?commit failed: rename \/var\/lib\/containerd\/io\.containerd\.content\.v1\.content\/ingest\/[^\s]+\/data \/var\/lib\/containerd\/io\.containerd\.content\.v1\.content\/blobs\/sha256\/[0-9a-f]+: no such file or directory/i
+    )
+  end
+
+  defp retry_label(:rate_limit), do: "the registry is rate limiting pulls"
+  defp retry_label(:content_store), do: "containerd content-store commit failed"
 
   # Docker Hub is the implicit registry for a short reference such as `nginx:1.28-alpine`.
   # Making it explicit in the update log helps an operator tell which registry is rate
