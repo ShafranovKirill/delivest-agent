@@ -97,21 +97,25 @@ defmodule DelivestAgent.BackupJobs do
 
           error ->
             Logger.error("cannot persist backup job status: #{inspect(error)}")
+            # No task has started; only this process can own this newly created claim.
+            case File.rmdir(claim_dir) do
+              :ok ->
+                :ok
+
+              remove_error ->
+                Logger.error("cannot release unstarted backup claim: #{inspect(remove_error)}")
+            end
+
             state
         end
 
       {:error, :eexist} ->
         case read_json(Path.join(job.dir, "status.json")) do
-          {:ok, %{"phase" => phase}} when phase in ["queued", "waiting", "running"] ->
-            write_status(
-              job,
-              "interrupted",
-              "agent restarted during backup job; manual review required",
-              false
-            )
+          {:ok, status} ->
+            unless terminal_status?(status, job), do: interrupt(job)
 
           _ ->
-            :ok
+            interrupt(job)
         end
 
         state
@@ -119,6 +123,21 @@ defmodule DelivestAgent.BackupJobs do
       _ ->
         state
     end
+  end
+
+  defp terminal_status?(status, job) do
+    status["id"] == job.id and status["action"] == job.request["action"] and
+      status["phase"] in ["complete", "failed", "interrupted"] and
+      is_boolean(status["safe_to_resume"])
+  end
+
+  defp interrupt(job) do
+    write_status(
+      job,
+      "interrupted",
+      "claimed backup job has unknown outcome; manual review required",
+      false
+    )
   end
 
   defp perform(state, job) do
