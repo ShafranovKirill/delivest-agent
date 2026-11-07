@@ -81,10 +81,106 @@ defmodule DelivestAgent.FullBackupTest do
              end)
 
     lock = Path.join(dir, ".delivest-operation.lock")
+    File.rm!(lock)
     File.mkdir!(lock)
     assert {:error, {1, message}} = OperationLock.with_lock(project, fn -> flunk("entered") end)
     assert message =~ "busy"
     assert File.dir?(lock)
+  end
+
+  test "operation lock releases after owner crash and rejects concurrent acquisition", %{
+    project: project
+  } do
+    parent = self()
+
+    owner =
+      spawn(fn ->
+        OperationLock.with_lock(project, fn ->
+          send(parent, :lock_held)
+          receive do: (:release -> :ok)
+        end)
+      end)
+
+    assert_receive :lock_held, 2_000
+
+    assert {_, 1} =
+             System.cmd("flock", [
+               "-n",
+               Path.join(project.dir, ".delivest-operation.lock"),
+               "true"
+             ])
+
+    attempts =
+      for _ <- 1..8 do
+        Task.async(fn -> OperationLock.with_lock(project, fn -> :entered end) end)
+      end
+
+    assert Enum.all?(attempts, fn task ->
+             match?({:error, {1, _}}, Task.await(task, 2_000))
+           end)
+
+    ref = Process.monitor(owner)
+    Process.exit(owner, :kill)
+    assert_receive {:DOWN, ^ref, :process, ^owner, :killed}
+
+    assert eventually(fn -> OperationLock.with_lock(project, fn -> :recovered end) end) ==
+             :recovered
+  end
+
+  test "operation lock releases after owning BEAM is killed", %{project: project} do
+    script =
+      "[dir] = System.argv(); DelivestAgent.OperationLock.with_lock(%{dir: dir}, fn -> IO.puts(\"LOCKED\"); Process.sleep(:infinity) end)"
+
+    port =
+      Port.open({:spawn_executable, System.find_executable("elixir")}, [
+        :binary,
+        :exit_status,
+        args: [
+          "-r",
+          Path.expand("lib/delivest_agent/operation_lock.ex"),
+          "-e",
+          script,
+          project.dir
+        ]
+      ])
+
+    assert_port_output(port, "LOCKED", 5_000)
+    assert {:error, {1, _}} = OperationLock.with_lock(project, fn -> :entered end)
+    {:os_pid, os_pid} = Port.info(port, :os_pid)
+    assert {_, 0} = System.cmd("kill", ["-KILL", Integer.to_string(os_pid)])
+    assert_receive {^port, {:exit_status, _}}, 5_000
+
+    assert eventually(fn -> OperationLock.with_lock(project, fn -> :recovered end) end) ==
+             :recovered
+  end
+
+  defp assert_port_output(port, expected, timeout, output \\ "") do
+    receive do
+      {^port, {:data, data}} ->
+        output = output <> data
+
+        unless String.contains?(output, expected),
+          do: assert_port_output(port, expected, timeout, output)
+
+      {^port, {:exit_status, status}} ->
+        flunk("lock subprocess exited with #{status}: #{output}")
+    after
+      timeout -> flunk("lock subprocess did not print #{expected}: #{output}")
+    end
+  end
+
+  defp eventually(fun, attempts \\ 100)
+  defp eventually(fun, 0), do: fun.()
+
+  defp eventually(fun, attempts) do
+    case fun.() do
+      {:error, _} ->
+        Process.sleep(20)
+        eventually(fun, attempts - 1)
+
+      result ->
+        result
+    end
   end
 
   test "full import requires explicit replace before reading Docker", %{

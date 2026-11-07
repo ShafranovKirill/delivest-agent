@@ -123,6 +123,43 @@ defmodule DelivestAgent.BackupJobsTest do
     GenServer.stop(pid)
   end
 
+  test "claimed job with missing or corrupt status requires review and never reruns", ctx do
+    request(ctx, "import", "compose")
+    File.mkdir!(Path.join(ctx.job_dir, "claimed"))
+    stub_compose(true)
+    {:ok, pid} = start(ctx)
+    assert status(ctx, "interrupted")["safe_to_resume"] == false
+    refute_receive {:engine, _, _}, 100
+    GenServer.stop(pid)
+
+    File.write!(Path.join(ctx.job_dir, "status.json"), "{invalid")
+    {:ok, pid} = start(ctx)
+    assert status(ctx, "interrupted")["safe_to_resume"] == false
+    refute_receive {:engine, _, _}, 100
+    GenServer.stop(pid)
+  end
+
+  test "claimed terminal status is preserved", ctx do
+    request(ctx, "export", "compose")
+    File.mkdir!(Path.join(ctx.job_dir, "claimed"))
+
+    original = %{
+      id: @id,
+      action: "export",
+      phase: "complete",
+      safe_to_resume: true,
+      message: "done"
+    }
+
+    File.write!(Path.join(ctx.job_dir, "status.json"), Jason.encode!(original))
+    stub_compose(true)
+    {:ok, pid} = start(ctx)
+    Process.sleep(80)
+    assert read_json(Path.join(ctx.job_dir, "status.json"))["message"] == "done"
+    refute_receive {:engine, _, _}
+    GenServer.stop(pid)
+  end
+
   test "invalid ID and action never invoke engine", ctx do
     request(ctx, "delete", "compose")
     stub_compose(true)
@@ -140,7 +177,12 @@ defmodule DelivestAgent.BackupJobsTest do
     stub_compose(true)
     {:ok, pid} = start(ctx)
     refute_receive {:engine, _, _}, 150
-    assert File.dir?(Path.join(ctx.job_dir, "claimed"))
+    refute File.exists?(Path.join(ctx.job_dir, "claimed"))
+    File.rmdir!(Path.join(ctx.job_dir, "status.json"))
+    send(pid, :poll)
+    assert_receive {:engine, :export, _}, 2_000
+    assert status(ctx, "complete")["safe_to_resume"] == true
+    refute_receive {:engine, _, _}, 100
     GenServer.stop(pid)
   end
 
@@ -188,7 +230,19 @@ defmodule DelivestAgent.BackupJobsTest do
     path = Path.join(ctx.job_dir, "status.json")
 
     Enum.reduce_while(1..100, nil, fn _, _ ->
-      value = if File.regular?(path), do: read_json(path), else: nil
+      value =
+        if File.regular?(path) do
+          case File.read(path) do
+            {:ok, bytes} ->
+              case Jason.decode(bytes) do
+                {:ok, json} -> json
+                _ -> nil
+              end
+
+            _ ->
+              nil
+          end
+        end
 
       if value && value["phase"] == phase,
         do: {:halt, value},
