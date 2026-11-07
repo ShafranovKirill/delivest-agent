@@ -178,6 +178,11 @@ defmodule DelivestAgent.BackupJobsTest do
     {:ok, pid} = start(ctx)
     refute_receive {:engine, _, _}, 150
     refute File.exists?(Path.join(ctx.job_dir, "claimed"))
+    File.rmdir!(Path.join(ctx.job_dir, "status.json"))
+    send(pid, :poll)
+    assert_receive {:engine, :export, _}, 2_000
+    assert status(ctx, "complete")["safe_to_resume"] == true
+    refute_receive {:engine, _, _}, 100
     GenServer.stop(pid)
   end
 
