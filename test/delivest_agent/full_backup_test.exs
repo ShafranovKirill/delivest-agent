@@ -317,6 +317,49 @@ defmodule DelivestAgent.FullBackupTest do
     refute Enum.any?(collect_calls([]), &Enum.member?(&1, "stop"))
   end
 
+  test "feature policy schema mismatch aborts before storage copy and database swap", %{
+    dir: dir,
+    project: project
+  } do
+    fake_docker(self(), feature_schema_mismatch: true)
+    assert {:error, {1, message}} = FullBackup.import(project, make_archive(dir), replace: true)
+    assert message =~ "feature policy schema mismatch"
+    calls = collect_calls([])
+
+    assert Enum.any?(calls, fn args ->
+             Enum.any?(args, &String.contains?(&1, "to_regclass('public.feature_gates')"))
+           end)
+
+    refute Enum.any?(calls, fn args ->
+             Enum.any?(args, &String.contains?(&1, "ALTER DATABASE %I"))
+           end)
+
+    refute Enum.any?(calls, fn args -> Enum.member?(args, "s3-id:/data") end)
+  end
+
+  test "feature policy is dumped and installed on staging before storage is touched", %{
+    dir: dir,
+    project: project
+  } do
+    fake_docker(self(), feature_schema: true)
+    assert {:ok, _} = FullBackup.import(project, make_archive(dir), replace: true)
+    calls = collect_calls([])
+
+    dump_at =
+      Enum.find_index(calls, fn args ->
+        Enum.any?(args, &String.contains?(&1, "--column-inserts"))
+      end)
+
+    apply_at =
+      Enum.find_index(calls, fn args ->
+        Enum.any?(args, &String.contains?(&1, "incoming_feature_generations"))
+      end)
+
+    storage_at = Enum.find_index(calls, fn args -> Enum.member?(args, "s3-id:/data") end)
+    assert is_integer(dump_at) and is_integer(apply_at) and is_integer(storage_at)
+    assert dump_at < apply_at and apply_at < storage_at
+  end
+
   test "storage install failure restores cold copy and restarts app", %{
     dir: dir,
     project: project
@@ -521,6 +564,16 @@ defmodule DelivestAgent.FullBackupTest do
         command == "docker" and
             Enum.any?(args, &String.contains?(&1, "schema_migrations ORDER BY")) ->
           {"20240101000000\n", 0}
+
+        command == "docker" and
+            Enum.any?(args, &String.contains?(&1, "to_regclass('public.feature_gates')")) ->
+          if opts[:feature_schema_mismatch] do
+            if Enum.any?(args, &String.starts_with?(&1, "delivest_restore_")),
+              do: {"0|0|0\n", 0},
+              else: {"1|1|1\n", 0}
+          else
+            if opts[:feature_schema], do: {"1|1|1\n", 0}, else: {"0|0|0\n", 0}
+          end
 
         command == "docker" and opts[:fail_dump] == true and
             Enum.any?(args, &String.contains?(&1, "pg_dump -U")) ->

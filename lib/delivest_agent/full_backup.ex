@@ -4,6 +4,7 @@ defmodule DelivestAgent.FullBackup do
   alias DelivestAgent.{Compose, OperationLock, Project, Runner}
   alias DelivestAgent.FullBackup.Archive
   alias DelivestAgent.FullBackup.Storage
+  alias DelivestAgent.FullBackup.FeaturePolicy
 
   @version 1
   @postgres "postgres"
@@ -624,6 +625,7 @@ defmodule DelivestAgent.FullBackup do
 
     result =
       with :ok <- stop_running(project, context, stop_services(context)),
+           :ok <- FeaturePolicy.preserve(project, stage, id),
            {:ok, _} <- docker(["cp", "#{context.s3["ID"]}:/data", Path.join(recovery, "data")]),
            {:ok, _} <- start_helper(context, helper),
            :ok <- mark_and_replace_storage(helper, Path.join(work, "data")),
