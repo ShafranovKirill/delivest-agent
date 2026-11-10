@@ -65,7 +65,9 @@ defmodule DelivestAgent.FullBackup.FeaturePolicy do
       COALESCE((SELECT max(id) FROM feature_audits), 1),
       EXISTS (SELECT 1 FROM feature_audits));
     UPDATE oban_jobs SET state = 'cancelled', cancelled_at = now()
-      WHERE worker IN ('Delivest.Background.Runner', 'Delivest.Background.Dispatcher')
+      WHERE (worker IN ('Delivest.Background.Runner', 'Delivest.Background.Dispatcher')
+        OR (jsonb_typeof(args->'optional_feature') = 'string'
+          AND NULLIF(args->>'optional_feature', '') IS NOT NULL))
         AND state IN ('available', 'scheduled', 'retryable', 'executing');
     DELETE FROM background_schedules;
     '''

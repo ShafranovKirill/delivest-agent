@@ -39,10 +39,13 @@ defmodule DelivestAgent.FeaturePolicyIntegrationTest do
                INSERT INTO feature_audits(id,feature,scope_key,enabled,generation,actor,inserted_at)
                  VALUES (8,'segments','franchise',true,99,'archive',now());
                INSERT INTO background_schedules(kind,scope_key) VALUES ('segments.refresh','franchise');
-               INSERT INTO oban_jobs(worker,state) VALUES
-                 ('Delivest.Background.Runner','available'),
-                 ('Delivest.Background.Dispatcher','executing'),
-                 ('Delivest.Payments.Worker','available');
+               INSERT INTO oban_jobs(worker,state,args) VALUES
+                 ('Delivest.Background.Runner','available','{}'),
+                 ('Delivest.Background.Dispatcher','executing','{}'),
+                 ('Delivest.Notifications.PushDeliveryWorker','available','{"optional_feature":"notifications"}'),
+                 ('Delivest.Notifications.DeliverWorker','retryable','{"optional_feature":"notifications"}'),
+                 ('Delivest.Notifications.DeliverWorker','available','{}'),
+                 ('Delivest.Payments.Worker','available','{}');
                """)
 
       FakeRunner.stub(fn "docker", args ->
@@ -77,6 +80,9 @@ defmodule DelivestAgent.FeaturePolicyIntegrationTest do
       assert rows =~ "6\n"
       assert rows =~ "Delivest.Background.Runner:cancelled"
       assert rows =~ "Delivest.Background.Dispatcher:cancelled"
+      assert rows =~ "Delivest.Notifications.PushDeliveryWorker:cancelled"
+      assert rows =~ "Delivest.Notifications.DeliverWorker:cancelled"
+      assert rows =~ "Delivest.Notifications.DeliverWorker:available"
       assert rows =~ "Delivest.Payments.Worker:available"
       assert String.ends_with?(String.trim(rows), "0")
     after
@@ -102,7 +108,8 @@ defmodule DelivestAgent.FeaturePolicyIntegrationTest do
     CREATE TABLE feature_audits(id bigserial PRIMARY KEY, feature text, scope_key text,
       enabled boolean, generation bigint, actor text, inserted_at timestamp);
     CREATE TABLE background_schedules(id bigserial PRIMARY KEY, kind text, scope_key text);
-    CREATE TABLE oban_jobs(id bigserial PRIMARY KEY, worker text, state text, cancelled_at timestamp);
+    CREATE TABLE oban_jobs(id bigserial PRIMARY KEY, worker text, state text,
+      args jsonb NOT NULL DEFAULT '{}'::jsonb, cancelled_at timestamp);
     """
   end
 
