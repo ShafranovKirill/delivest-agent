@@ -29,7 +29,7 @@ defmodule DelivestAgent.Bastion do
         pending: []
       )
 
-    Logger.info("connecting to bastion #{url} as #{instance_id}")
+    Logger.info("connecting to bastion #{URI.parse(url).host || "unknown"} as #{instance_id}")
 
     {:ok,
      connect!(socket,
@@ -109,15 +109,18 @@ defmodule DelivestAgent.Bastion do
 
   @impl Slipstream
   def handle_disconnect(reason, socket) do
-    Logger.warning("bastion disconnected: #{inspect(reason)}")
+    Logger.warning("bastion disconnected: #{disconnect_reason(reason)}")
     reconnect(socket)
   end
 
   @impl Slipstream
   def handle_topic_close(topic, reason, socket) do
-    Logger.warning("bastion closed #{topic}: #{inspect(reason)}")
+    Logger.warning("bastion closed #{topic}: #{disconnect_reason(reason)}")
     rejoin(socket, topic, info())
   end
+
+  defp disconnect_reason(reason) when reason in [:closed, :normal, :timeout], do: reason
+  defp disconnect_reason(_reason), do: "transport error"
 
   defp finish({:command, id}, result, socket) do
     Process.cancel_timer(socket.assigns.running.timer)

@@ -1,5 +1,6 @@
 defmodule DelivestAgent.BastionTest do
   use Slipstream.SocketTest
+  import ExUnit.CaptureLog
 
   alias DelivestAgent.{Bastion, ComposeStub, FakeRunner}
 
@@ -38,6 +39,36 @@ defmodule DelivestAgent.BastionTest do
   test "builds the socket url with the token and instance id" do
     assert Bastion.socket_uri("wss://b.example.com/", "t", "id") ==
              "wss://b.example.com/agent/websocket?instance_id=id&token=t"
+  end
+
+  test "connection logs exclude URL credentials and transport details" do
+    previous_level = Logger.level()
+    Logger.configure(level: :info)
+    on_exit(fn -> Logger.configure(level: previous_level) end)
+
+    log =
+      capture_log([level: :info], fn ->
+        {:ok, socket} =
+          Bastion.init(%{
+            url: "wss://private-user:private-password@b.example.com/path?session=private-query",
+            token: "private-token"
+          })
+
+        send(self(), {:test_socket, socket})
+      end)
+
+    assert log =~ "connecting to bastion b.example.com"
+    refute log =~ "private-"
+
+    assert_receive {:test_socket, socket}
+
+    log =
+      capture_log(fn ->
+        Bastion.handle_disconnect({:error, "private-disconnect"}, socket)
+      end)
+
+    assert log =~ "transport error"
+    refute log =~ "private-disconnect"
   end
 
   test "joins with instance info and sends heartbeats", %{topic: topic} do
