@@ -155,6 +155,7 @@ defmodule DelivestAgent.BackupJobs do
             state.engine.export(project, archive,
               app_stopped: job.request["mode"] == "external",
               progress: fn step, safe -> progress(job, step, safe) end,
+              failure: fn step -> failed_step(job, step) end,
               require_ready: true,
               job_dir: job.dir,
               job_id: job.id
@@ -167,6 +168,7 @@ defmodule DelivestAgent.BackupJobs do
                   replace: true,
                   app_stopped: job.request["mode"] == "external",
                   progress: fn step, safe -> progress(job, step, safe) end,
+                  failure: fn step -> failed_step(job, step) end,
                   require_ready: true,
                   job_dir: job.dir,
                   job_id: job.id
@@ -274,6 +276,17 @@ defmodule DelivestAgent.BackupJobs do
     write_status(job, phase, String.replace(step, "_", " "), safe, step)
   end
 
+  defp failed_step(job, step) when is_binary(step) do
+    path = Path.join(job.dir, "status.json")
+
+    case read_json(path) do
+      {:ok, status} -> atomic_json(path, Map.put(status, "failed_step", step), job.dir)
+      _ -> :ok
+    end
+  end
+
+  defp failed_step(_job, _step), do: :ok
+
   defp write_status(job, phase, message, safe, step \\ nil) do
     path = Path.join(job.dir, "status.json")
 
@@ -300,7 +313,8 @@ defmodule DelivestAgent.BackupJobs do
       safe_to_resume: safe,
       updated_at: at,
       step: step,
-      steps: steps
+      steps: steps,
+      failed_step: previous["failed_step"]
     }
 
     case atomic_json(path, status, job.dir) do

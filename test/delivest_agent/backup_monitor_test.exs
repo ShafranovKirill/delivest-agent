@@ -41,7 +41,7 @@ defmodule DelivestAgent.BackupMonitorTest do
     public = path |> File.read!() |> Jason.decode!()
 
     assert Map.keys(public) |> Enum.sort() ==
-             ~w(action phase reason_code safe_to_resume step steps updated_at)
+             ~w(action failed_step phase reason_code safe_to_resume step steps updated_at)
 
     assert public["reason_code"] == "migration_mismatch"
     assert public["steps"] == [%{"step" => "accepted", "updated_at" => "2026-01-01T00:00:00Z"}]

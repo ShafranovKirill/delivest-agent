@@ -29,6 +29,7 @@ defmodule DelivestAgent.FullBackup do
   defp normalize_error(result), do: result
 
   defp execute(kind, project, path, opts) do
+    Process.delete({__MODULE__, :last_step})
     id = :crypto.strong_rand_bytes(8) |> Base.encode16(case: :lower)
     work = Path.join(System.tmp_dir!(), "delivest-full-backup-#{id}")
 
@@ -45,6 +46,7 @@ defmodule DelivestAgent.FullBackup do
           error -> {:error, {1, Exception.message(error)}}
         after
           File.rm_rf(work)
+          Process.delete({__MODULE__, :last_step})
         end
 
       {:error, reason} ->
@@ -346,6 +348,10 @@ defmodule DelivestAgent.FullBackup do
   end
 
   defp finish_services(project, context, outcome, opts) do
+    if match?({:error, _}, outcome) and opts[:failure] do
+      opts[:failure].(Process.get({__MODULE__, :last_step}))
+    end
+
     managed? = Enum.any?(context.containers, &(&1["Service"] == "server"))
     if managed?, do: progress(opts, "restarting", true)
 
@@ -445,6 +451,7 @@ defmodule DelivestAgent.FullBackup do
   end
 
   defp progress(opts, step, safe \\ false) do
+    Process.put({__MODULE__, :last_step}, step)
     if callback = opts[:progress], do: callback.(step, safe), else: :ok
   end
 

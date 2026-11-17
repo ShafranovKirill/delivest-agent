@@ -396,7 +396,22 @@ defmodule DelivestAgent.FullBackupTest do
     project: project
   } do
     fake_docker(self(), fail_storage: true)
-    assert {:error, {1, _}} = FullBackup.import(project, make_archive(dir), replace: true)
+    parent = self()
+
+    assert {:error, {1, _}} =
+             FullBackup.import(project, make_archive(dir),
+               replace: true,
+               progress: fn step, safe ->
+                 send(parent, {:progress, step, safe})
+                 :ok
+               end,
+               failure: fn step ->
+                 send(parent, {:failed_step, step})
+                 :ok
+               end
+             )
+
+    assert_receive {:failed_step, "replacing_storage"}
     calls = collect_calls([])
     assert Enum.count(calls, &storage_install_call?/1) == 2
     assert Enum.any?(calls, &(Enum.take(&1, -2) == ["start", "server"]))

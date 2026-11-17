@@ -203,7 +203,8 @@ defmodule DelivestAgent.BackupJobsTest do
     request(ctx, "export", "compose")
     File.mkdir!(Path.join(ctx.job_dir, "status.json"))
     stub_compose(true)
-    {:ok, pid} = start(ctx)
+    {:ok, pid} = start(ctx, poll_ms: 10_000)
+    _ = :sys.get_state(pid)
     refute_receive {:engine, _, _}, 150
     refute File.exists?(Path.join(ctx.job_dir, "claimed"))
     File.rmdir!(Path.join(ctx.job_dir, "status.json"))

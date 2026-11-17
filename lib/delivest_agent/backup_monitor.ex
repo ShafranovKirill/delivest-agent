@@ -16,6 +16,7 @@ defmodule DelivestAgent.BackupMonitor do
         action: allow(status[:action], ~w(import export), "unknown"),
         phase: allow(status[:phase], @phases, "failed"),
         step: allow(status[:step], @steps, "accepted"),
+        failed_step: allow(status[:failed_step], @steps, nil),
         steps: safe_steps(status[:steps]),
         safe_to_resume: status[:safe_to_resume] == true,
         updated_at: status[:updated_at],
