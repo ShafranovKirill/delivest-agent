@@ -23,6 +23,13 @@ defmodule DelivestAgent.BackupJobsTest do
         {:engine, :import, opts}
       )
 
+      if Application.get_env(:delivest_agent, :backup_jobs_test_progress) do
+        opts[:progress].("validating_archive", false)
+        opts[:progress].("restarting", true)
+        opts[:progress].("checking_readiness", true)
+        opts[:progress].("ready", true)
+      end
+
       Application.get_env(:delivest_agent, :backup_jobs_test_result, {:ok, "done"})
     end
   end
@@ -32,6 +39,7 @@ defmodule DelivestAgent.BackupJobsTest do
     File.mkdir_p!(Path.join([dir, "jobs", @id]))
     Application.put_env(:delivest_agent, :backup_jobs_test_pid, self())
     Application.delete_env(:delivest_agent, :backup_jobs_test_result)
+    Application.delete_env(:delivest_agent, :backup_jobs_test_progress)
 
     project = %Project{
       name: "test",
@@ -43,6 +51,7 @@ defmodule DelivestAgent.BackupJobsTest do
     on_exit(fn ->
       Application.delete_env(:delivest_agent, :backup_jobs_test_pid)
       Application.delete_env(:delivest_agent, :backup_jobs_test_result)
+      Application.delete_env(:delivest_agent, :backup_jobs_test_progress)
       Application.delete_env(:delivest_agent, FakeRunner)
       File.rm_rf!(dir)
     end)
@@ -93,6 +102,25 @@ defmodule DelivestAgent.BackupJobsTest do
     assert_receive {:engine, :import, opts}, 2_000
     assert opts[:replace] == true
     assert status(ctx, "failed")["safe_to_resume"] == false
+    GenServer.stop(pid)
+  end
+
+  test "import records ordered steps while keeping the phase protocol", ctx do
+    request(ctx, "import", "compose")
+    File.write!(Path.join(ctx.job_dir, "archive.tar"), "uploaded")
+    Application.put_env(:delivest_agent, :backup_jobs_test_progress, true)
+    stub_compose(true)
+    {:ok, pid} = start(ctx)
+    assert_receive {:engine, :import, opts}, 2_000
+    assert opts[:require_ready] == true
+    result = status(ctx, "complete")
+    assert result["step"] == "ready"
+    assert result["safe_to_resume"] == true
+
+    assert Enum.map(result["steps"], & &1["step"]) ==
+             ~w(accepted quiescing validating_archive restarting checking_readiness ready)
+
+    assert Enum.all?(result["steps"], &is_binary(&1["updated_at"]))
     GenServer.stop(pid)
   end
 

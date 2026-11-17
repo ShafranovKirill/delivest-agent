@@ -4,6 +4,7 @@ defmodule DelivestAgent.FullBackupTest do
   alias DelivestAgent.{FakeRunner, FullBackup, OperationLock, Project}
   alias DelivestAgent.FullBackup.Archive
   alias DelivestAgent.FullBackup.Storage
+  alias DelivestAgent.FullBackup.MigrationCompatibility
 
   setup do
     dir = Path.join(System.tmp_dir!(), "full-backup-test-#{System.unique_integer([:positive])}")
@@ -317,6 +318,36 @@ defmodule DelivestAgent.FullBackupTest do
     refute Enum.any?(collect_calls([]), &Enum.member?(&1, "stop"))
   end
 
+  test "129-version historical source can restore to a 40-version baseline target" do
+    baseline = for n <- 2..10, do: "202612100000" <> String.pad_leading(to_string(n), 2, "0")
+    legacy = MigrationCompatibility.legacy_versions()
+    later = for n <- 11..41, do: "202612100000" <> String.pad_leading(to_string(n), 2, "0")
+    source = legacy ++ ["20261121000003"] ++ baseline ++ later
+    target = baseline ++ later
+
+    assert length(legacy) == 88
+    assert length(source) == 129
+    assert length(target) == 40
+    assert MigrationCompatibility.compatible?(source, target)
+    refute MigrationCompatibility.compatible?(source -- [hd(legacy)], target)
+    refute MigrationCompatibility.compatible?(source, target -- [hd(baseline)])
+    refute MigrationCompatibility.compatible?(source -- [hd(baseline)], target)
+    refute MigrationCompatibility.compatible?(source ++ ["20261210000099"], target)
+    assert MigrationCompatibility.compatible?(target, target)
+  end
+
+  test "staging ledger mismatch aborts before stopping services", %{dir: dir, project: project} do
+    fake_docker(self(), staged_migrations: "20240101000001\n")
+    assert {:error, {1, message}} = FullBackup.import(project, make_archive(dir), replace: true)
+    assert message =~ "staging schema_migrations differ"
+    calls = collect_calls([])
+    refute Enum.any?(calls, &Enum.member?(&1, "stop"))
+
+    refute Enum.any?(calls, fn args ->
+             Enum.any?(args, &String.contains?(&1, "ALTER DATABASE %I"))
+           end)
+  end
+
   test "feature policy schema mismatch aborts before storage copy and database swap", %{
     dir: dir,
     project: project
@@ -563,7 +594,9 @@ defmodule DelivestAgent.FullBackupTest do
 
         command == "docker" and
             Enum.any?(args, &String.contains?(&1, "schema_migrations ORDER BY")) ->
-          {"20240101000000\n", 0}
+          if Enum.any?(args, &String.starts_with?(&1, "delivest_restore_")),
+            do: {opts[:staged_migrations] || "20240101000000\n", 0},
+            else: {"20240101000000\n", 0}
 
         command == "docker" and
             Enum.any?(args, &String.contains?(&1, "to_regclass('public.feature_gates')")) ->

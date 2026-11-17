@@ -1,10 +1,11 @@
 defmodule DelivestAgent.FullBackup do
   @moduledoc false
 
-  alias DelivestAgent.{Compose, OperationLock, Project, Runner}
+  alias DelivestAgent.{Compose, Config, OperationLock, Project, Runner, Status}
   alias DelivestAgent.FullBackup.Archive
   alias DelivestAgent.FullBackup.Storage
   alias DelivestAgent.FullBackup.FeaturePolicy
+  alias DelivestAgent.FullBackup.MigrationCompatibility
 
   @version 1
   @postgres "postgres"
@@ -52,6 +53,8 @@ defmodule DelivestAgent.FullBackup do
   end
 
   defp do_export(project, path, work, id, opts) do
+    progress(opts, "exporting")
+
     with {:ok, context} <- context(project, opts),
          :ok <- ensure_destination(path) do
       outcome =
@@ -83,23 +86,29 @@ defmodule DelivestAgent.FullBackup do
 
       if match?({:ok, _}, outcome) and opts[:leave_stopped] == true,
         do: outcome,
-        else: finish_services(project, context, outcome)
+        else: finish_services(project, context, outcome, opts)
     end
   end
 
   defp do_import(project, path, work, id, opts) do
+    progress(opts, "validating_archive")
+
     with :ok <- Archive.extract(path, work),
          {:ok, manifest} <- read_manifest(work),
          :ok <- verify_files(work, manifest),
          :ok <- Archive.validate(Path.join(work, "storage.tar"), :storage),
          {:ok, context} <- context(project, opts),
+         :ok <- progress(opts, "checking_compatibility"),
          :ok <- compatible?(project, context, manifest),
+         :ok <- progress(opts, "preparing_storage"),
          :ok <- extract_storage(work),
          :ok <- Storage.prepare(work),
-         {:ok, staged} <- stage_database(project, context, work, id) do
+         :ok <- progress(opts, "staging_database"),
+         {:ok, staged} <- stage_database(project, context, work, id),
+         :ok <- verify_staged_migrations(project, staged, manifest) do
       outcome =
         try do
-          install(project, context, work, staged, id)
+          install(project, context, work, staged, id, opts)
         rescue
           error ->
             {:error,
@@ -109,7 +118,7 @@ defmodule DelivestAgent.FullBackup do
 
       case outcome do
         {:error, {2, _}} -> outcome
-        _ -> finish_services(project, context, outcome)
+        _ -> finish_services(project, context, outcome, opts)
       end
     else
       {:error, message} when is_binary(message) -> {:error, {1, message}}
@@ -275,11 +284,17 @@ defmodule DelivestAgent.FullBackup do
     end
   end
 
-  defp migrations(project) do
+  defp migrations(project, database \\ nil) do
     script =
-      ~S'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Atqc "SELECT version FROM schema_migrations ORDER BY version"'
+      ~S'psql -U "$POSTGRES_USER" -d "$1" -Atqc "SELECT version FROM schema_migrations ORDER BY version"'
 
-    case Compose.run(project, ["exec", "-T", @postgres, "sh", "-ec", script]) do
+    script = if database, do: script, else: String.replace(script, ~S'"$1"', ~S'"$POSTGRES_DB"')
+
+    args =
+      ["exec", "-T", @postgres, "sh", "-ec", script] ++
+        if(database, do: ["sh", database], else: [])
+
+    case Compose.run(project, args) do
       {:ok, output} -> {:ok, String.split(String.trim(output), "\n", trim: true)}
       _ -> {:error, {1, "cannot read schema_migrations"}}
     end
@@ -330,7 +345,10 @@ defmodule DelivestAgent.FullBackup do
     Enum.any?(context.containers, &(&1["Service"] == service and &1["State"] == "running"))
   end
 
-  defp finish_services(project, context, outcome) do
+  defp finish_services(project, context, outcome, opts) do
+    managed? = Enum.any?(context.containers, &(&1["Service"] == "server"))
+    if managed?, do: progress(opts, "restarting", true)
+
     restart =
       Enum.reduce_while(start_services(context), :ok, fn service, :ok ->
         if running?(context, service) do
@@ -354,7 +372,12 @@ defmodule DelivestAgent.FullBackup do
 
     case {outcome, restart} do
       {{:ok, message}, :ok} ->
-        {:ok, message}
+        unless managed?, do: progress(opts, "restarting", true)
+
+        with :ok <- check_readiness(project, context, opts) do
+          if opts[:require_ready], do: progress(opts, "ready", true)
+          {:ok, message}
+        end
 
       {{:error, _} = error, :ok} ->
         error
@@ -365,6 +388,64 @@ defmodule DelivestAgent.FullBackup do
       {{:error, {_, message}}, {:error, reason}} ->
         {:error, {2, message <> "; " <> reason <> "; application remains stopped"}}
     end
+  end
+
+  defp check_readiness(_project, _context, opts) when not is_list(opts), do: :ok
+
+  defp check_readiness(_project, context, opts) do
+    if opts[:require_ready] == true do
+      progress(opts, "checking_readiness", true)
+
+      if Enum.any?(context.containers, &(&1["Service"] == "server")) do
+        wait_ready(
+          fn ->
+            case Config.host("api") do
+              nil ->
+                false
+
+              host ->
+                Status.check(Config.get(:gateway_url, "http://gateway"), host, :api)["ok"] == true
+            end
+          end,
+          60
+        )
+      else
+        marker = Path.join([opts[:job_dir], "resumed.json"])
+
+        wait_ready(
+          fn ->
+            case File.read(marker) do
+              {:ok, bytes} ->
+                case Jason.decode(bytes) do
+                  {:ok, %{"id" => id}} -> id == opts[:job_id]
+                  _ -> false
+                end
+
+              _ ->
+                false
+            end
+          end,
+          60
+        )
+      end
+    else
+      :ok
+    end
+  end
+
+  defp wait_ready(_check, 0), do: {:error, {2, "application did not become ready after restore"}}
+
+  defp wait_ready(check, attempts) do
+    if check.() do
+      :ok
+    else
+      Process.sleep(1_000)
+      wait_ready(check, attempts - 1)
+    end
+  end
+
+  defp progress(opts, step, safe \\ false) do
+    if callback = opts[:progress], do: callback.(step, safe), else: :ok
   end
 
   defp wait_s3(_container, 0), do: {:error, "timeout after 120 seconds"}
@@ -519,9 +600,9 @@ defmodule DelivestAgent.FullBackup do
         {:error, {1, "S3_PRIVATE_BUCKET differs from backup"}}
 
       not is_list(manifest["schema_migrations"]) or
-          not MapSet.subset?(
-            MapSet.new(manifest["schema_migrations"]),
-            MapSet.new(context.migrations)
+          not MigrationCompatibility.compatible?(
+            manifest["schema_migrations"],
+            context.migrations
           ) ->
         {:error, {1, "target schema_migrations do not include source versions"}}
 
@@ -531,6 +612,22 @@ defmodule DelivestAgent.FullBackup do
       true ->
         :ok
     end
+  end
+
+  defp verify_staged_migrations(project, stage, manifest) do
+    result =
+      case migrations(project, stage) do
+        {:ok, versions} ->
+          if Enum.sort(versions) == Enum.sort(manifest["schema_migrations"]),
+            do: :ok,
+            else: {:error, {1, "staging schema_migrations differ from backup manifest"}}
+
+        error ->
+          error
+      end
+
+    if result != :ok, do: drop_database(project, stage)
+    result
   end
 
   defp ensure_destination(path) do
@@ -616,7 +713,7 @@ defmodule DelivestAgent.FullBackup do
     Compose.run(project, ["exec", "-T", @postgres, "sh", "-ec", script, "sh", database])
   end
 
-  defp install(project, context, work, stage, id) do
+  defp install(project, context, work, stage, id, opts) do
     recovery = Path.join(project.dir, ".delivest-recovery-#{id}")
     previous = "delivest_previous_#{id}"
     helper = "delivest-storage-restore-#{id}"
@@ -628,7 +725,9 @@ defmodule DelivestAgent.FullBackup do
            :ok <- FeaturePolicy.preserve(project, stage, id),
            {:ok, _} <- docker(["cp", "#{context.s3["ID"]}:/data", Path.join(recovery, "data")]),
            {:ok, _} <- start_helper(context, helper),
+           :ok <- progress(opts, "replacing_storage"),
            :ok <- mark_and_replace_storage(helper, Path.join(work, "data")),
+           :ok <- progress(opts, "replacing_database"),
            :ok <- swap_databases(project, stage, previous) do
         {:ok,
          "full restore complete; previous database #{previous}, previous storage #{recovery}/data" <>

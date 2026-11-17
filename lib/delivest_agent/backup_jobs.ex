@@ -144,6 +144,7 @@ defmodule DelivestAgent.BackupJobs do
     with {:ok, project} <- project(state),
          {:ok, services} <- Compose.services(project),
          :ok <- mode_check(job.request["mode"], services),
+         :ok <- progress(job, "quiescing", false),
          :ok <- wait_quiesced(job, state.quiesce_timeout_ms),
          :ok <- write_status(job, "running", "full #{job.request["action"]} running", false) do
       archive = Path.join(job.dir, "archive.tar")
@@ -151,14 +152,24 @@ defmodule DelivestAgent.BackupJobs do
       result =
         case job.request["action"] do
           "export" ->
-            state.engine.export(project, archive, app_stopped: job.request["mode"] == "external")
+            state.engine.export(project, archive,
+              app_stopped: job.request["mode"] == "external",
+              progress: fn step, safe -> progress(job, step, safe) end,
+              require_ready: true,
+              job_dir: job.dir,
+              job_id: job.id
+            )
 
           "import" ->
             if regular?(archive),
               do:
                 state.engine.import(project, archive,
                   replace: true,
-                  app_stopped: job.request["mode"] == "external"
+                  app_stopped: job.request["mode"] == "external",
+                  progress: fn step, safe -> progress(job, step, safe) end,
+                  require_ready: true,
+                  job_dir: job.dir,
+                  job_id: job.id
                 ),
               else: {:error, {1, "uploaded archive.tar is missing"}}
         end
@@ -240,23 +251,71 @@ defmodule DelivestAgent.BackupJobs do
   defp heartbeat(nil), do: :ok
 
   defp heartbeat(dir) do
-    if File.dir?(dir),
-      do: atomic_json(Path.join(dir, "heartbeat.json"), %{protocol: 1, updated_at: now()}, dir)
+    if File.dir?(dir) do
+      case atomic_json(Path.join(dir, "heartbeat.json"), %{protocol: 1, updated_at: now()}, dir) do
+        :ok ->
+          try do
+            DelivestAgent.BackupMonitor.heartbeat(dir)
+          rescue
+            error ->
+              Logger.warning("cannot publish backup heartbeat: #{Exception.message(error)}")
+          end
+
+        _ ->
+          :ok
+      end
+    end
   end
 
-  defp write_status(job, phase, message, safe) do
-    atomic_json(
-      Path.join(job.dir, "status.json"),
-      %{
-        id: job.id,
-        action: job.request["action"],
-        phase: phase,
-        message: to_string(message),
-        safe_to_resume: safe,
-        updated_at: now()
-      },
-      job.dir
-    )
+  defp progress(job, step, safe) do
+    phase =
+      if step == "quiescing" and job.request["mode"] == "external", do: "waiting", else: "running"
+
+    write_status(job, phase, String.replace(step, "_", " "), safe, step)
+  end
+
+  defp write_status(job, phase, message, safe, step \\ nil) do
+    path = Path.join(job.dir, "status.json")
+
+    previous =
+      case read_json(path) do
+        {:ok, status} -> status
+        _ -> %{}
+      end
+
+    step = step || previous["step"] || "accepted"
+    at = now()
+    steps = previous["steps"] || []
+
+    steps =
+      if Enum.any?(steps, &(&1["step"] == step)),
+        do: steps,
+        else: steps ++ [%{step: step, updated_at: at}]
+
+    status = %{
+      id: job.id,
+      action: job.request["action"],
+      phase: phase,
+      message: to_string(message),
+      safe_to_resume: safe,
+      updated_at: at,
+      step: step,
+      steps: steps
+    }
+
+    case atomic_json(path, status, job.dir) do
+      :ok ->
+        try do
+          DelivestAgent.BackupMonitor.publish(job.dir, status)
+        rescue
+          error -> Logger.warning("cannot publish backup monitor: #{Exception.message(error)}")
+        end
+
+        :ok
+
+      error ->
+        error
+    end
   end
 
   defp read_json(path) do
