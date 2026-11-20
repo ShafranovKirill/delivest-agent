@@ -386,9 +386,62 @@ defmodule DelivestAgent.FullBackupTest do
         Enum.any?(args, &String.contains?(&1, "incoming_feature_generations"))
       end)
 
+    header_at =
+      Enum.find_index(calls, fn args ->
+        Enum.any?(args, &String.contains?(&1, "grep -Fxc"))
+      end)
+
     storage_at = Enum.find_index(calls, fn args -> Enum.member?(args, "s3-id:/data") end)
-    assert is_integer(dump_at) and is_integer(apply_at) and is_integer(storage_at)
-    assert dump_at < apply_at and apply_at < storage_at
+
+    assert is_integer(dump_at) and is_integer(header_at) and is_integer(apply_at) and
+             is_integer(storage_at)
+
+    assert dump_at < header_at and header_at < apply_at and apply_at < storage_at
+  end
+
+  test "unexpected feature policy dump header aborts before touching storage", %{
+    dir: dir,
+    project: project
+  } do
+    fake_docker(self(), feature_schema: true, fail_feature_header: true)
+
+    assert {:error, {1, message}} =
+             FullBackup.import(project, make_archive(dir), replace: true)
+
+    assert message =~ "cannot preserve target host feature policy"
+
+    refute Enum.any?(collect_calls([]), &Enum.member?(&1, "s3-id:/data"))
+  end
+
+  test "feature policy dump normalization changes one exact header and rejects missing or duplicate headers",
+       %{
+         dir: dir,
+         project: project
+       } do
+    fake_docker(self(), feature_schema: true)
+    assert {:ok, _} = FullBackup.import(project, make_archive(dir), replace: true)
+
+    args =
+      collect_calls([])
+      |> Enum.find(fn args -> Enum.any?(args, &String.contains?(&1, "grep -Fxc")) end)
+
+    script = Enum.find(args, &String.contains?(&1, "grep -Fxc"))
+    path = Path.join(dir, "feature-policy.sql")
+    header = "SELECT pg_catalog.set_config('search_path', '', false);"
+    replacement = "SELECT pg_catalog.set_config('search_path', 'public, pg_temp', false);"
+    lookalike = "SELECT pg_catalogXset_config('search_path', '', false);"
+    data = "INSERT INTO feature_audits (details) VALUES ('#{header}');"
+
+    File.write!(path, Enum.join([header, lookalike, data], "\n") <> "\n")
+    assert {_, 0} = System.cmd("sh", ["-ec", script, "sh", path], stderr_to_stdout: true)
+    assert File.read!(path) == Enum.join([replacement, lookalike, data], "\n") <> "\n"
+
+    for bad <- [data <> "\n", header <> "\n" <> header <> "\n"] do
+      File.write!(path, bad)
+      assert {_, status} = System.cmd("sh", ["-ec", script, "sh", path], stderr_to_stdout: true)
+      assert status != 0
+      assert File.read!(path) == bad
+    end
   end
 
   test "storage install failure restores cold copy and restarts app", %{
@@ -626,6 +679,10 @@ defmodule DelivestAgent.FullBackupTest do
         command == "docker" and opts[:fail_dump] == true and
             Enum.any?(args, &String.contains?(&1, "pg_dump -U")) ->
           {"dump failed", 1}
+
+        command == "docker" and opts[:fail_feature_header] == true and
+            Enum.any?(args, &String.contains?(&1, "grep -Fxc")) ->
+          {"unexpected header", 1}
 
         command == "docker" and opts[:fail_restore] == true and
             Enum.any?(args, &String.contains?(&1, "pg_restore -U")) ->
