@@ -13,7 +13,7 @@ defmodule DelivestAgent.Release do
   same names without overwriting each other's rollback tags.
   """
 
-  alias DelivestAgent.{Compose, Config, MigrationLedger, Project, Runner, Status}
+  alias DelivestAgent.{Compose, Config, Env, MigrationLedger, Project, Runner, Status}
 
   @state_version 2
   @legacy_tag "delivest-previous"
@@ -70,13 +70,16 @@ defmodule DelivestAgent.Release do
   is recreated. Returns the list of target images, which the health check
   compares with what actually runs afterwards.
   """
-  def record_attempt(%Project{} = project, definitions) do
+  def record_attempt(%Project{} = project, definitions, manifest \\ nil, refs_before \\ nil) do
     with {:ok, images} <- target_images(definitions),
          {:ok, state} <- load() do
       attempt = %{
         "at" => now(),
         "git" => git_head(project.dir),
-        "images" => images
+        "images" => images,
+        "manifest" => manifest,
+        "image_refs_before" => refs_before || current_refs(project),
+        "image_refs_selected" => current_refs(project)
       }
 
       case save(Map.put(state, "attempt", attempt)) do
@@ -139,6 +142,31 @@ defmodule DelivestAgent.Release do
       {:ok, %{"previous" => %{} = previous}} -> {:ok, previous}
       {:ok, _state} -> {:error, {1, "there is no previous release to roll back to"}}
       error -> error
+    end
+  end
+
+  def interrupted_attempt do
+    with {:ok, state} <- load() do
+      if is_map(state["attempt"]), do: {:ok, state}, else: :none
+    end
+  end
+
+  def clear_attempt do
+    with {:ok, state} <- load(), do: save(Map.put(state, "attempt", nil))
+  end
+
+  def mark_preparing(%Project{}, manifest, refs_before) do
+    with {:ok, state} <- load() do
+      attempt = %{
+        "at" => now(),
+        "git" => manifest["root_sha"],
+        "images" => [],
+        "manifest" => manifest,
+        "image_refs_before" => refs_before,
+        "phase" => "preparing"
+      }
+
+      save(Map.put(state, "attempt", attempt))
     end
   end
 
@@ -345,10 +373,16 @@ defmodule DelivestAgent.Release do
   defp summary(nil), do: nil
 
   defp summary(release) do
+    manifest = release["manifest"] || %{}
+
     %{
       "at" => release["at"],
       "git" => release["git"],
-      "images" => length(release["images"] || [])
+      "images" => length(release["images"] || []),
+      "version" => manifest["version"],
+      "root_sha" => manifest["root_sha"],
+      "gitlinks" => manifest["gitlinks"],
+      "digest" => manifest["images"]
     }
   end
 
@@ -364,7 +398,13 @@ defmodule DelivestAgent.Release do
 
   defp ensure_current(project, state) do
     with {:ok, images} <- capture(project) do
-      release = %{"at" => now(), "git" => git_head(project.dir), "images" => images}
+      release = %{
+        "at" => now(),
+        "git" => git_head(project.dir),
+        "images" => images,
+        "image_refs_selected" => current_refs(project)
+      }
+
       key = release_key(release)
 
       with {:ok, tagged} <- tag_release(project, images, key) do
@@ -394,15 +434,13 @@ defmodule DelivestAgent.Release do
   # makes a retry behave exactly like a manual rollback.
   defp discard_attempt(_project, %{"attempt" => nil} = state, log), do: {:ok, state, log}
 
-  defp discard_attempt(project, %{"attempt" => attempt} = state, log) do
-    case git_reset(project.dir, (state["current"] || %{})["git"]) do
-      {:ok, output} ->
-        {:ok, %{state | "attempt" => nil},
-         log <>
-           "discarded the unfinished update of #{attempt["git"] || attempt["at"]}\n" <> output}
+  defp discard_attempt(_project, %{"attempt" => _attempt}, _state),
+    do: {:error, "unfinished update requires recovery before another update"}
 
-      {:error, {_status, output}} ->
-        {:error, "cannot discard the unfinished update: #{String.trim(output)}"}
+  defp current_refs(project) do
+    case Env.image_refs(project) do
+      {:ok, refs} -> refs
+      _ -> %{}
     end
   end
 
@@ -686,15 +724,6 @@ defmodule DelivestAgent.Release do
     case git(dir, ["rev-parse", "HEAD"]) do
       {:ok, sha} -> String.trim(sha)
       _ -> nil
-    end
-  end
-
-  defp git_reset(_dir, nil), do: {:ok, ""}
-
-  defp git_reset(dir, sha) do
-    case git(dir, ["reset", "--keep", sha]) do
-      {:ok, output} -> {:ok, output}
-      {:error, {_status, output}} -> {:error, {1, output}}
     end
   end
 

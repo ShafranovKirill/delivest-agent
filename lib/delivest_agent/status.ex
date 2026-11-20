@@ -6,6 +6,7 @@ defmodule DelivestAgent.Status do
   def collect(project_result) do
     base = %{
       "agent_version" => Config.version(),
+      "capabilities" => ["release_manifest_v1"],
       "collected_at" => DateTime.utc_now() |> DateTime.truncate(:second) |> DateTime.to_iso8601(),
       "checks" => checks(),
       "config_errors" => Config.config_errors(),
@@ -65,8 +66,25 @@ defmodule DelivestAgent.Status do
 
         agent =
           case agent do
-            [agent | _] -> Map.take(agent, ["image", "revision", "version"])
-            [] -> nil
+            [agent | _] ->
+              image = agent["image"]
+
+              digest =
+                case image do
+                  "ghcr.io/shafranovkirill/delivest-agent@sha256:" <> value
+                  when byte_size(value) == 64 ->
+                    "sha256:" <> value
+
+                  _ ->
+                    nil
+                end
+
+              agent
+              |> Map.take(["image", "image_id", "revision", "version"])
+              |> Map.put("digest", digest)
+
+            [] ->
+              nil
           end
 
         {containers, agent}

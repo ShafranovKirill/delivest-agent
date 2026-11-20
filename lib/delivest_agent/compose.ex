@@ -10,6 +10,16 @@ defmodule DelivestAgent.Compose do
     end
   end
 
+  def agent_image_ref(%Project{} = project) do
+    with {:ok, output} <- run(project, ["config", "--format", "json"]),
+         {:ok, %{"services" => services}} <- Jason.decode(json_body(output)),
+         %{"image" => image} when is_binary(image) <- services[project.agent_service] do
+      {:ok, image}
+    else
+      _ -> {:error, {1, "cannot resolve the agent image from Compose config"}}
+    end
+  end
+
   # The image reference is the only thing that decides whether a pull can be skipped.
   # A digest always points at the same content, while a tag (including latest) may be
   # moved by the publisher. The application images deliberately use latest, so they are

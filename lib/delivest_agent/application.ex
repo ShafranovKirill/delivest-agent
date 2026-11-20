@@ -9,7 +9,7 @@ defmodule DelivestAgent.Application do
 
     children =
       [{Task.Supervisor, name: DelivestAgent.TaskSupervisor}] ++
-        backup_job_children() ++ bastion_children()
+        backup_job_children() ++ recovery_children() ++ bastion_children()
 
     Supervisor.start_link(children, strategy: :one_for_one, name: DelivestAgent.Supervisor)
   end
@@ -35,6 +35,31 @@ defmodule DelivestAgent.Application do
       true ->
         Logger.warning("BASTION_URL or BASTION_TOKEN is not set, the agent stays idle")
         []
+    end
+  end
+
+  defp recovery_children do
+    if Application.get_env(:delivest_agent, :start_bastion, true) do
+      [
+        {Task,
+         fn ->
+           case DelivestAgent.Project.discover() do
+             {:ok, project} ->
+               case DelivestAgent.Commands.recover_interrupted(project) do
+                 :ok ->
+                   :ok
+
+                 {:error, reason} ->
+                   Logger.error("interrupted release recovery failed: #{inspect(reason)}")
+               end
+
+             _ ->
+               :ok
+           end
+         end}
+      ]
+    else
+      []
     end
   end
 end

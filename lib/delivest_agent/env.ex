@@ -2,6 +2,7 @@ defmodule DelivestAgent.Env do
   alias DelivestAgent.Project
 
   @max_size 256_000
+  @image_keys ~w(DELIVEST_SERVER_IMAGE DELIVEST_CLIENT_IMAGE DELIVEST_AGENT_IMAGE)
 
   def path(%Project{dir: dir}), do: Path.join(dir, ".env")
 
@@ -49,11 +50,10 @@ defmodule DelivestAgent.Env do
     path = path(project)
     tmp = path <> ".tmp"
     owner = owner(path, project.dir)
-    content = normalize(content)
+    content = preserve_image_refs(project, normalize(content))
 
     with :ok <- backup(path, owner),
-         :ok <- File.write(tmp, content),
-         :ok <- apply_owner(tmp, owner),
+         :ok <- secure_write(tmp, content, owner),
          :ok <- File.rename(tmp, path) do
       {:ok, "saved #{byte_size(content)} bytes, the previous version is in .env.bak"}
     else
@@ -65,9 +65,119 @@ defmodule DelivestAgent.Env do
 
   def write(%Project{}, _content), do: {:error, {1, "content is required"}}
 
+  # These assignments are the durable Compose selection. They live in the default
+  # Compose .env so a normal operator `docker compose up` uses the selected release.
+  def select_images(%Project{} = project, refs) when is_map(refs) do
+    with {:ok, content} <- read(project),
+         true <-
+           map_size(refs) > 0 and
+             Enum.all?(refs, fn {key, value} ->
+               key in ~w(server client agent) and is_binary(value)
+             end) do
+      existing =
+        case image_refs(project) do
+          {:ok, refs} -> refs
+          _ -> %{}
+        end
+
+      selected_refs =
+        Map.merge(
+          existing,
+          Map.new(refs, fn {key, value} -> {"DELIVEST_#{String.upcase(key)}_IMAGE", value} end)
+        )
+
+      selected =
+        Enum.map_join(selected_refs, "\n", fn {key, value} -> "#{key}=#{value}" end)
+
+      write_raw(project, strip_image_refs(content) <> selected <> "\n")
+    else
+      false -> {:error, {1, "invalid image references"}}
+      error -> error
+    end
+  end
+
+  def image_refs(%Project{} = project) do
+    with {:ok, content} <- read(project) do
+      refs =
+        content
+        |> String.split("\n")
+        |> Enum.reduce(%{}, fn line, acc ->
+          case String.split(line, "=", parts: 2) do
+            [key, value] when key in @image_keys -> Map.put(acc, key, value)
+            _ -> acc
+          end
+        end)
+
+      {:ok, refs}
+    end
+  end
+
+  def restore_image_refs(%Project{} = project, refs) when is_map(refs) do
+    with {:ok, content} <- read(project) do
+      assignments = Enum.map_join(refs, "\n", fn {key, value} -> "#{key}=#{value}" end)
+      suffix = if assignments == "", do: "", else: assignments <> "\n"
+      write_raw(project, strip_image_refs(content) <> suffix)
+    end
+  end
+
+  def restore_site_refs(%Project{} = project, refs) when is_map(refs) do
+    with {:ok, current} <- image_refs(project) do
+      restore_image_refs(
+        project,
+        Map.merge(
+          Map.take(current, ["DELIVEST_AGENT_IMAGE"]),
+          Map.take(refs, ["DELIVEST_SERVER_IMAGE", "DELIVEST_CLIENT_IMAGE"])
+        )
+      )
+    end
+  end
+
+  defp preserve_image_refs(project, content) do
+    case image_refs(project) do
+      {:ok, refs} ->
+        suffix = Enum.map_join(refs, "\n", fn {key, value} -> "#{key}=#{value}" end)
+        strip_image_refs(content) <> if(suffix == "", do: "", else: suffix <> "\n")
+
+      _ ->
+        content
+    end
+  end
+
+  defp strip_image_refs(content) do
+    content
+    |> String.split("\n")
+    |> Enum.reject(fn line -> Enum.any?(@image_keys, &String.starts_with?(line, &1 <> "=")) end)
+    |> Enum.join("\n")
+    |> normalize()
+  end
+
+  defp write_raw(project, content) do
+    path = path(project)
+    tmp = path <> ".tmp"
+    owner = owner(path, project.dir)
+
+    with :ok <- secure_write(tmp, normalize(content), owner),
+         :ok <- File.rename(tmp, path) do
+      {:ok, "selected Compose image references"}
+    else
+      {:error, reason} ->
+        File.rm(tmp)
+        {:error, {1, "cannot save Compose image references: #{:file.format_error(reason)}"}}
+    end
+  end
+
   defp normalize(content) do
     content = String.replace(content, "\r\n", "\n")
     if String.ends_with?(content, "\n"), do: content, else: content <> "\n"
+  end
+
+  defp secure_write(path, content, owner) do
+    with {:ok, file} <- File.open(path, [:write, :binary, :sync]),
+         :ok <- apply_owner(path, owner) do
+      result = IO.binwrite(file, content)
+      File.close(file)
+      result
+    end
   end
 
   defp backup(path, owner) do
