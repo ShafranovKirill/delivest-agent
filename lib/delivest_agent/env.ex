@@ -193,7 +193,7 @@ defmodule DelivestAgent.Env do
   defp owner(path, dir) do
     case File.stat(path) do
       {:ok, %{uid: uid, gid: gid, mode: mode}} ->
-        {uid, gid, Bitwise.band(mode, 0o777)}
+        {uid, gid, Bitwise.band(mode, 0o660)}
 
       _ ->
         %{uid: uid, gid: gid} = File.stat!(dir)

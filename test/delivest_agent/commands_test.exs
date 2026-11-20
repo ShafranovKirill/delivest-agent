@@ -6,6 +6,8 @@ defmodule DelivestAgent.CommandsTest do
   @moduletag :tmp_dir
 
   setup %{tmp_dir: dir} do
+    previous_data_dir = Application.get_env(:delivest_agent, :data_dir)
+    Application.put_env(:delivest_agent, :data_dir, dir)
     File.rm(Release.state_path())
     File.rm(Release.state_path() <> ".tmp")
     FakeRunner.stub(ComposeStub.runner(self(), dir))
@@ -22,6 +24,10 @@ defmodule DelivestAgent.CommandsTest do
     Application.put_env(:delivest_agent, :gateway_url, gateway)
 
     on_exit(fn ->
+      if previous_data_dir,
+        do: Application.put_env(:delivest_agent, :data_dir, previous_data_dir),
+        else: Application.delete_env(:delivest_agent, :data_dir)
+
       restore_env(:hosts, previous)
       restore_env(:gateway_url, previous_gateway)
     end)
