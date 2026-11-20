@@ -3,7 +3,7 @@ defmodule DelivestAgent.Bastion do
 
   require Logger
 
-  alias DelivestAgent.{Commands, Config, Identity, Project, Status}
+  alias DelivestAgent.{CommandJournal, Commands, Config, Identity, Project, Status}
 
   @command_timeout :timer.minutes(40)
 
@@ -54,7 +54,13 @@ defmodule DelivestAgent.Bastion do
   @impl Slipstream
   def handle_message(topic, "command", %{"id" => id, "action" => action} = payload, socket)
       when topic == socket.assigns.topic do
+    args = Map.get(payload, "args") || %{}
+
     cond do
+      socket.assigns.running && socket.assigns.running.id == id ->
+        push(socket, socket.assigns.topic, "command_started", %{"id" => id})
+        {:ok, socket}
+
       socket.assigns.running ->
         {:ok, reply(socket, id, false, "busy: another command is running")}
 
@@ -62,16 +68,35 @@ defmodule DelivestAgent.Bastion do
         {:ok, reply(socket, id, false, "unknown action: #{action}")}
 
       true ->
-        Logger.info("running #{action} (#{id})")
-        push(socket, socket.assigns.topic, "command_started", %{"id" => id})
-        args = Map.get(payload, "args") || %{}
-        task = start_task(fn -> Commands.run(action, args) end)
-        timer = Process.send_after(self(), {:command_timeout, task.ref}, @command_timeout)
+        case CommandJournal.claim(id, action, args) do
+          {:new, journal_path} ->
+            Logger.info("running #{action} (#{id})")
+            push(socket, socket.assigns.topic, "command_started", %{"id" => id})
+            task = start_task(fn -> Commands.run(action, args) end)
+            timer = Process.send_after(self(), {:command_timeout, task.ref}, @command_timeout)
 
-        {:ok,
-         socket
-         |> assign(running: %{id: id, action: action, task: task, timer: timer})
-         |> track(task, {:command, id})}
+            {:ok,
+             socket
+             |> assign(
+               running: %{
+                 id: id,
+                 action: action,
+                 task: task,
+                 timer: timer,
+                 journal_path: journal_path
+               }
+             )
+             |> track(task, {:command, id})}
+
+          {:complete, %{"ok" => ok?, "output" => output}} ->
+            {:ok, reply(socket, id, ok?, output)}
+
+          {:interrupted, reason} ->
+            {:ok, reply(socket, id, false, reason)}
+
+          {:error, reason} ->
+            {:ok, reply(socket, id, false, reason)}
+        end
     end
   end
 
@@ -125,11 +150,18 @@ defmodule DelivestAgent.Bastion do
   defp finish({:command, id}, result, socket) do
     Process.cancel_timer(socket.assigns.running.timer)
 
-    socket =
+    {ok?, output} =
       case result do
-        {:ok, output} -> reply(socket, id, true, output)
-        {:error, output} -> reply(socket, id, false, output)
+        {:ok, output} -> {true, output}
+        {:error, output} -> {false, output}
       end
+
+    journal_result = CommandJournal.finish(socket.assigns.running.journal_path, ok?, output)
+
+    if journal_result != :ok,
+      do: Logger.error("cannot save command result #{id}: #{inspect(journal_result)}")
+
+    socket = reply(socket, id, ok?, output)
 
     socket |> assign(running: nil) |> schedule_heartbeat(0)
   end
@@ -177,6 +209,7 @@ defmodule DelivestAgent.Bastion do
       "name" => Config.get(:instance_name) || Config.hosts()["api"],
       "hosts" => Config.hosts(),
       "agent_version" => Config.version(),
+      "capabilities" => ["release_manifest_v1"],
       "actions" => Commands.actions()
     }
   end
