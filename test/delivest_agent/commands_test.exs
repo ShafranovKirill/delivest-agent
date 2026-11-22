@@ -245,6 +245,32 @@ defmodule DelivestAgent.CommandsTest do
     assert output =~ "confirmed release"
     assert output =~ "healthy after"
 
+    sha = manifest["root_sha"]
+    git = ["git", "-C", dir]
+    fetch = git ++ ["fetch", "--no-recurse-submodules", "origin", sha]
+    checkout = git ++ ["checkout", "--detach", sha]
+
+    if File.stat!(dir).uid == 0 do
+      assert_received {:cmd, "git",
+                       ["-C", ^dir, "fetch", "--no-recurse-submodules", "origin", ^sha]}
+
+      assert_received {:cmd, "git", ["-C", ^dir, "checkout", "--detach", ^sha]}
+    else
+      assert_received {:cmd, "setpriv",
+                       ["--reuid", _, "--regid", _, "--clear-groups", "env", "HOME=/tmp" | ^fetch]}
+
+      assert_received {:cmd, "setpriv",
+                       [
+                         "--reuid",
+                         _,
+                         "--regid",
+                         _,
+                         "--clear-groups",
+                         "env",
+                         "HOME=/tmp" | ^checkout
+                       ]}
+    end
+
     assert File.read!(Path.join(dir, ".env")) =~
              "DELIVEST_SERVER_IMAGE=ghcr.io/shafranovkirill/delivest-server@#{manifest["images"]["server"]}"
 

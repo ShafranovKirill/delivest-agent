@@ -649,7 +649,8 @@ defmodule DelivestAgent.Commands do
              "https://github.com/ShafranovKirill/delivest.git",
              "git@github.com:ShafranovKirill/delivest.git"
            ],
-         {:ok, output} <- git_release(dir, ["fetch", "origin", manifest["root_sha"]]),
+         {:ok, output} <-
+           git_release(dir, ["fetch", "--no-recurse-submodules", "origin", manifest["root_sha"]]),
          {:ok, tree} <- git_release(dir, ["ls-tree", manifest["root_sha"]]) do
       links = manifest["gitlinks"]
 
