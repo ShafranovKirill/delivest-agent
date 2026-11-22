@@ -37,6 +37,23 @@ defmodule DelivestAgent.FullBackup.FeaturePolicy do
   defp compatible_tables(_, _),
     do: {:error, {1, "feature policy schema mismatch; restore aborted"}}
 
+  # pg_dump clears search_path, while feature-gate triggers call storefront
+  # functions without schema qualification. Normalize only that known header.
+  defp normalize_dump_header(project, remote) do
+    script = ~S'''
+    header="SELECT pg_catalog.set_config('search_path', '', false);"
+    replacement="SELECT pg_catalog.set_config('search_path', 'public, pg_temp', false);"
+    test "$(grep -Fxc "$header" "$1")" = 1
+    sed -i "s/^SELECT pg_catalog\\.set_config('search_path', '', false);$/SELECT pg_catalog.set_config('search_path', 'public, pg_temp', false);/" "$1"
+    test "$(grep -Fxc "$replacement" "$1")" = 1
+    '''
+
+    case Compose.run(project, ["exec", "-T", "postgres", "sh", "-ec", script, "sh", remote]) do
+      {:ok, _} -> :ok
+      _ -> {:error, {1, "cannot normalize feature policy dump header"}}
+    end
+  end
+
   defp apply_policy(_project, _stage, _remote, "0|0|0"), do: :ok
 
   defp apply_policy(project, stage, remote, "1|1|1") do
@@ -79,6 +96,7 @@ defmodule DelivestAgent.FullBackup.FeaturePolicy do
 
     with {:ok, _} <-
            Compose.run(project, ["exec", "-T", "postgres", "sh", "-ec", dump, "sh", remote]),
+         :ok <- normalize_dump_header(project, remote),
          {:ok, _} <-
            Compose.run(project, [
              "exec",

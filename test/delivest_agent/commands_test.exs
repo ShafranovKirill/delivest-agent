@@ -1,11 +1,13 @@
 defmodule DelivestAgent.CommandsTest do
   use ExUnit.Case, async: false
 
-  alias DelivestAgent.{Backup, Commands, ComposeStub, FakeRunner, Project, Release}
+  alias DelivestAgent.{Backup, Commands, ComposeStub, Env, FakeRunner, Project, Release}
 
   @moduletag :tmp_dir
 
   setup %{tmp_dir: dir} do
+    previous_data_dir = Application.get_env(:delivest_agent, :data_dir)
+    Application.put_env(:delivest_agent, :data_dir, dir)
     File.rm(Release.state_path())
     File.rm(Release.state_path() <> ".tmp")
     FakeRunner.stub(ComposeStub.runner(self(), dir))
@@ -22,6 +24,10 @@ defmodule DelivestAgent.CommandsTest do
     Application.put_env(:delivest_agent, :gateway_url, gateway)
 
     on_exit(fn ->
+      if previous_data_dir,
+        do: Application.put_env(:delivest_agent, :data_dir, previous_data_dir),
+        else: Application.delete_env(:delivest_agent, :data_dir)
+
       restore_env(:hosts, previous)
       restore_env(:gateway_url, previous_gateway)
     end)
@@ -230,6 +236,204 @@ defmodule DelivestAgent.CommandsTest do
     assert state["attempt"] == nil
   end
 
+  test "selected release uses registry digests while verifying local image IDs", %{dir: dir} do
+    manifest = selected_manifest()
+    selected_runner(dir)
+    project = Project.discover("agent-container")
+
+    assert {:ok, output} = Commands.run("update", %{"release" => manifest}, project)
+    assert output =~ "confirmed release"
+    assert output =~ "healthy after"
+
+    sha = manifest["root_sha"]
+    git = ["git", "-C", dir]
+    fetch = git ++ ["fetch", "--no-recurse-submodules", "origin", sha]
+    checkout = git ++ ["checkout", "--detach", sha]
+
+    if File.stat!(dir).uid == 0 do
+      assert_received {:cmd, "git",
+                       ["-C", ^dir, "fetch", "--no-recurse-submodules", "origin", ^sha]}
+
+      assert_received {:cmd, "git", ["-C", ^dir, "checkout", "--detach", ^sha]}
+    else
+      assert_received {:cmd, "setpriv",
+                       ["--reuid", _, "--regid", _, "--clear-groups", "env", "HOME=/tmp" | ^fetch]}
+
+      assert_received {:cmd, "setpriv",
+                       [
+                         "--reuid",
+                         _,
+                         "--regid",
+                         _,
+                         "--clear-groups",
+                         "env",
+                         "HOME=/tmp" | ^checkout
+                       ]}
+    end
+
+    assert File.read!(Path.join(dir, ".env")) =~
+             "DELIVEST_SERVER_IMAGE=ghcr.io/shafranovkirill/delivest-server@#{manifest["images"]["server"]}"
+
+    refute File.read!(Path.join(dir, ".env")) =~ "DELIVEST_AGENT_IMAGE="
+    assert Release.rollback_info()["current"]["version"] == "1.2.3"
+    assert Release.rollback_info()["current"]["digest"] == manifest["images"]
+    assert_received {:cmd, "docker", ["image", "inspect" | _]}
+  end
+
+  test "invalid selected release and unavailable GHCR leave current refs untouched", %{dir: dir} do
+    selected_runner(dir, docker_pull: {"GHCR unavailable", 1})
+    project = Project.discover("agent-container")
+    manifest = selected_manifest()
+    File.write!(Path.join(dir, ".env"), "CUSTOM=keep\n")
+
+    assert {:error, _} =
+             Commands.run(
+               "update",
+               %{"release" => put_in(manifest, ["images", "server"], nil)},
+               project
+             )
+
+    refute_received {:cmd, "docker", ["pull" | _]}
+    assert {:error, output} = Commands.run("update", %{"release" => manifest}, project)
+    assert output =~ "GHCR unavailable"
+    assert File.read!(Path.join(dir, ".env")) == "CUSTOM=keep\n"
+    refute Enum.any?(compose_calls(), &match?(["up" | _], &1))
+  end
+
+  test "failed readiness restores site refs and preserves separately selected agent", %{dir: dir} do
+    selected_runner(dir, ps: {restarting(), 0})
+    project = Project.discover("agent-container")
+
+    File.write!(
+      Path.join(dir, ".env"),
+      "DELIVEST_AGENT_IMAGE=ghcr.io/shafranovkirill/delivest-agent@sha256:#{String.duplicate("d", 64)}\n"
+    )
+
+    assert {:error, output} = Commands.run("update", %{"release" => selected_manifest()}, project)
+    assert output =~ "automatic rollback"
+    env = File.read!(Path.join(dir, ".env"))
+    assert env =~ "DELIVEST_AGENT_IMAGE=ghcr.io/shafranovkirill/delivest-agent@"
+    refute env =~ "DELIVEST_SERVER_IMAGE="
+    assert Release.rollback_info()["current"]["version"] == nil
+  end
+
+  test "restart recovery restores previous release after preparation was interrupted", %{dir: dir} do
+    selected_runner(dir)
+    project = Project.discover("agent-container") |> elem(1)
+    File.write!(Path.join(dir, ".env"), "DELIVEST_AGENT_IMAGE=old-agent\n")
+    assert {:ok, _state, _log} = Release.begin_update(project)
+
+    assert :ok =
+             Release.mark_preparing(project, selected_manifest(), %{
+               "DELIVEST_AGENT_IMAGE" => "old-agent"
+             })
+
+    assert {:ok, _} =
+             Env.select_images(project, %{"server" => "new-server", "client" => "new-client"})
+
+    assert :ok = Commands.recover_interrupted(project)
+    assert Release.rollback_info()["attempt"] == nil
+    env = File.read!(Path.join(dir, ".env"))
+    assert env =~ "DELIVEST_AGENT_IMAGE=old-agent"
+    refute env =~ "DELIVEST_SERVER_IMAGE=new-server"
+    refute env =~ "DELIVEST_CLIENT_IMAGE=new-client"
+  end
+
+  test "agent update refuses a Compose revision that ignores the selected digest", %{dir: dir} do
+    selected_runner(dir)
+    project = Project.discover("agent-container")
+
+    assert {:error, output} =
+             Commands.run("agent_update", %{"release" => selected_manifest()}, project)
+
+    assert output =~ "Compose does not use the selected agent image"
+    refute File.read!(Path.join(dir, ".env")) =~ "DELIVEST_AGENT_IMAGE="
+    refute_received {:cmd, "docker", ["run" | _]}
+  end
+
+  defp selected_manifest do
+    sha = String.duplicate("a", 40)
+    digest = "sha256:" <> String.duplicate("b", 64)
+
+    %{
+      "version" => "1.2.3",
+      "root_sha" => sha,
+      "gitlinks" => Map.new(~w(server client agent), &{&1, sha}),
+      "images" => Map.new(~w(server client agent), &{&1, digest})
+    }
+  end
+
+  defp selected_runner(dir, extra \\ []) do
+    File.mkdir!(Path.join(dir, ".git"))
+    manifest = selected_manifest()
+
+    git = fn _command, args ->
+      cond do
+        "get-url" in args ->
+          {"https://github.com/ShafranovKirill/delivest.git\n", 0}
+
+        "ls-tree" in args ->
+          {Enum.map_join(
+             ~w(server client agent),
+             "\n",
+             &"160000 commit #{manifest["gitlinks"][&1]}\t#{&1}"
+           ) <> "\n", 0}
+
+        true ->
+          {"done\n", 0}
+      end
+    end
+
+    config = fn _command, _args ->
+      {body, 0} = ComposeStub.default_response(:config_json, dir, [])
+      config = Jason.decode!(body)
+
+      env =
+        case File.read(Path.join(dir, ".env")) do
+          {:ok, text} -> text
+          _ -> ""
+        end
+
+      services =
+        Enum.reduce(~w(server client), config["services"], fn component, acc ->
+          key = "DELIVEST_#{String.upcase(component)}_IMAGE="
+
+          ref =
+            env
+            |> String.split("\n")
+            |> Enum.find_value(fn line ->
+              if String.starts_with?(line, key),
+                do: String.replace_prefix(line, key, ""),
+                else: nil
+            end)
+
+          if ref, do: put_in(acc, [component, "image"], ref), else: acc
+        end)
+
+      {Jason.encode!(%{"services" => services}), 0}
+    end
+
+    image_inspect = fn _command, args ->
+      ref = List.last(args)
+
+      if String.starts_with?(ref, "ghcr.io/shafranovkirill/delivest-client@") do
+        format = args |> Enum.drop_while(&(&1 != "--format")) |> Enum.at(1) || ""
+
+        if String.contains?(format, "version"),
+          do: {"sha256:444|2.0.0\n", 0},
+          else: {"sha256:444\n", 0}
+      else
+        ComposeStub.default_response(:image_inspect, dir, args)
+      end
+    end
+
+    overrides =
+      %{git: git, config_json: config, image_inspect: image_inspect}
+      |> Map.merge(Map.new(extra))
+
+    FakeRunner.stub(ComposeStub.runner(self(), dir, overrides))
+  end
+
   test "update backs up the database first and stops when the backup fails", %{dir: dir} do
     FakeRunner.stub(ComposeStub.runner(self(), dir, %{cp: &write_copy/2}))
     args = %{"upload_url" => "https://bastion/agent/backups/1", "token" => "secret"}
@@ -367,8 +571,8 @@ defmodule DelivestAgent.CommandsTest do
            ]
 
     assert {:error, second} = Commands.run("update", %{}, project)
-    assert second =~ "database migrations changed"
-    assert :counters.get(started, 1) == 2
+    assert second =~ "unfinished update requires recovery"
+    assert :counters.get(started, 1) == 1
   end
 
   test "manual rollback refuses a changed migration ledger before changing git or containers", %{
@@ -752,6 +956,8 @@ defmodule DelivestAgent.CommandsTest do
 
     assert status["agent"] == %{
              "image" => "ghcr.io/x/delivest-agent:latest",
+             "image_id" => "sha256:666",
+             "digest" => nil,
              "revision" => "agent42",
              "version" => nil
            }

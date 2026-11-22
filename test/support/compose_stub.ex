@@ -31,6 +31,7 @@ defmodule DelivestAgent.ComposeStub do
 
   def key("docker", ["inspect" | _]), do: :revisions
   def key("docker", ["image", "inspect" | _]), do: :image_inspect
+  def key("docker", ["pull" | _]), do: :docker_pull
   def key("docker", ["ps", "--filter" | _]), do: :migration_container
   def key("docker", ["exec", "-i" | _]), do: :migration_exec
   def key("docker", ["tag" | _]), do: :tag

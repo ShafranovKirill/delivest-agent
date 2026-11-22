@@ -7,6 +7,7 @@ defmodule DelivestAgent.Commands do
     OperationLock,
     Project,
     Release,
+    ReleaseManifest,
     Runner,
     Status
   }
@@ -17,6 +18,24 @@ defmodule DelivestAgent.Commands do
   @max_tail 2_000
 
   def actions, do: @actions
+
+  def recover_interrupted(%Project{} = project) do
+    OperationLock.with_lock(project, fn ->
+      case Release.interrupted_attempt() do
+        :none ->
+          :ok
+
+        {:ok, state} ->
+          case rollback(project, state["current"], "interrupted update recovery", true) do
+            {:ok, _log} -> Release.clear_attempt()
+            {:error, reason} -> {:error, reason}
+          end
+
+        error ->
+          error
+      end
+    end)
+  end
 
   def run(action, args \\ %{}, project_result \\ Project.discover())
 
@@ -62,30 +81,9 @@ defmodule DelivestAgent.Commands do
   # does not answer, or answers from an old container, brings back the confirmed
   # release. The confirmed and previous releases are never overwritten by an attempt.
   defp execute("update", args, project, _services) do
-    case Release.begin_update(project) do
-      {:ok, state, begin_log} ->
-        case steps([
-               {"backup before update", fn -> backup_before_update(project, args) end},
-               {"git pull", fn -> git_pull(project.dir) end}
-             ]) do
-          {:ok, log} ->
-            case prepare_images(project, state) do
-              {:ok, definitions, pull_log, target} ->
-                start_update(project, state, begin_log <> log <> pull_log, definitions, target)
-
-              {:error, prepare_log} ->
-                {:error, begin_log <> log <> prepare_log}
-            end
-
-          {:error, log} ->
-            prepare_failed(project, state, begin_log <> log)
-
-          error ->
-            error
-        end
-
-      {:error, message} ->
-        {:error, message}
+    case args["release"] do
+      nil -> legacy_update(args, project)
+      manifest -> pinned_update(args, project, manifest)
     end
   end
 
@@ -108,6 +106,29 @@ defmodule DelivestAgent.Commands do
 
       {:error, {_status, message}} ->
         {:error, message}
+    end
+  end
+
+  defp execute("agent_update", %{"release" => manifest}, project, _services) do
+    with {:ok, manifest} <- ReleaseManifest.validate(manifest),
+         {:ok, _} <- pull_release_images(manifest, ["agent"]),
+         {:ok, refs_before} <- Env.image_refs(project) do
+      with {:ok, _} <-
+             Env.select_images(project, %{"agent" => ReleaseManifest.ref(manifest, "agent")}),
+           {:ok, resolved} <- Compose.agent_image_ref(project),
+           true <- resolved == ReleaseManifest.ref(manifest, "agent"),
+           {:ok, result} <- Release.start_agent_updater(project) do
+        {:ok, result}
+      else
+        error ->
+          Env.restore_image_refs(project, refs_before)
+
+          if error == false,
+            do: {:error, "Compose does not use the selected agent image"},
+            else: error
+      end
+    else
+      {:error, reason} -> {:error, reason}
     end
   end
 
@@ -170,6 +191,98 @@ defmodule DelivestAgent.Commands do
       service in [nil, ""] -> Compose.logs(project, services, tail(args["tail"]))
       service in services -> Compose.logs(project, [service], tail(args["tail"]))
       true -> {:error, "unknown service: #{service}"}
+    end
+  end
+
+  defp legacy_update(args, project) do
+    case Release.begin_update(project) do
+      {:ok, state, begin_log} ->
+        case steps([
+               {"backup before update", fn -> backup_before_update(project, args) end},
+               {"git pull", fn -> git_pull(project.dir) end}
+             ]) do
+          {:ok, log} ->
+            case prepare_images(project, state) do
+              {:ok, definitions, pull_log, target} ->
+                start_update(project, state, begin_log <> log <> pull_log, definitions, target)
+
+              {:error, prepare_log} ->
+                {:error, begin_log <> log <> prepare_log}
+            end
+
+          {:error, log} ->
+            prepare_failed(project, state, begin_log <> log)
+
+          error ->
+            error
+        end
+
+      {:error, message} ->
+        {:error, message}
+    end
+  end
+
+  defp pinned_update(args, project, manifest) do
+    with {:ok, manifest} <- ReleaseManifest.validate(manifest),
+         {:ok, state, begin_log} <- Release.begin_update(project) do
+      refs_before =
+        case Env.image_refs(project) do
+          {:ok, refs} -> refs
+          _ -> %{}
+        end
+
+      case steps([
+             {"backup before update", fn -> backup_before_update(project, args) end},
+             {"fetch the selected revision", fn -> git_fetch_release(project.dir, manifest) end},
+             {"pull selected images", fn -> pull_release_images(manifest, ~w(server client)) end},
+             {"remember release preparation",
+              fn ->
+                case Release.mark_preparing(project, manifest, refs_before) do
+                  :ok -> {:ok, "preparation recorded"}
+                  {:error, reason} -> {:error, {1, reason}}
+                end
+              end},
+             {"checkout selected revision",
+              fn -> git_checkout_release(project.dir, manifest) end},
+             {"save selected images",
+              fn ->
+                Env.select_images(
+                  project,
+                  Map.take(ReleaseManifest.refs(manifest), ~w(server client))
+                )
+              end}
+           ]) do
+        {:ok, log} ->
+          case prepare_images(project, state, manifest, refs_before) do
+            {:ok, definitions, pull_log, target} ->
+              start_update(project, state, begin_log <> log <> pull_log, definitions, target)
+
+            {:error, prepare_log} ->
+              pinned_prepare_failed(project, state, refs_before, begin_log <> log <> prepare_log)
+          end
+
+        {:error, log} ->
+          pinned_prepare_failed(project, state, refs_before, begin_log <> log)
+      end
+    else
+      {:error, reason} -> {:error, reason}
+    end
+  end
+
+  defp pinned_prepare_failed(project, state, refs_before, log) do
+    refs = Env.restore_image_refs(project, refs_before)
+    git = git_reset(project.dir, (state["current"] || %{})["git"])
+
+    case {refs, git} do
+      {{:ok, _}, {:ok, output}} ->
+        case Release.clear_attempt() do
+          :ok -> {:error, log <> section("git reset", output)}
+          {:error, reason} -> {:error, log <> "cannot clear failed attempt: #{reason}"}
+        end
+
+      _ ->
+        {:error,
+         log <> "failed to restore previous checkout or image references: #{inspect({refs, git})}"}
     end
   end
 
@@ -263,30 +376,46 @@ defmodule DelivestAgent.Commands do
     end
   end
 
-  defp prepare_images(project, state) do
+  defp prepare_images(project, state, manifest \\ nil, refs_before \\ nil) do
     case Compose.definitions(project) do
       {:ok, definitions} ->
-        case pull_images(project, definitions) do
-          {:ok, pull_log} ->
-            case Release.record_attempt(project, definitions) do
-              {:ok, target} ->
-                {:ok, definitions, pull_log, target}
+        if manifest && not selected_definitions?(definitions, manifest) do
+          prepare_failed(
+            project,
+            state,
+            "selected checkout does not resolve release image references"
+          )
+        else
+          case pull_images(project, definitions) do
+            {:ok, pull_log} ->
+              case Release.record_attempt(project, definitions, manifest, refs_before) do
+                {:ok, target} ->
+                  {:ok, definitions, pull_log, target}
 
-              {:error, message} ->
-                prepare_failed(
-                  project,
-                  state,
-                  "== remember the target release failed\n#{message}\n"
-                )
-            end
+                {:error, message} ->
+                  prepare_failed(
+                    project,
+                    state,
+                    "== remember the target release failed\n#{message}\n"
+                  )
+              end
 
-          {:error, pull_log} ->
-            prepare_failed(project, state, pull_log)
+            {:error, pull_log} ->
+              prepare_failed(project, state, pull_log)
+          end
         end
 
       {:error, {_status, output}} ->
         prepare_failed(project, state, section("read the compose services failed", output))
     end
+  end
+
+  defp selected_definitions?(definitions, manifest) do
+    by_name = Map.new(definitions, &{&1.name, &1.image})
+
+    Enum.all?(~w(server client), fn component ->
+      ReleaseManifest.ref(manifest, component) == by_name[component]
+    end)
   end
 
   # A pull that did not finish leaves the checkout on the new revision while the
@@ -325,9 +454,15 @@ defmodule DelivestAgent.Commands do
       {:error, started_log} ->
         rollback_log =
           case rollback(project, state["current"], "automatic rollback", true) do
-            {:ok, output} -> output
-            {:error, {_status, output}} -> output
-            {:error, output} -> output
+            {:ok, output} ->
+              Release.clear_attempt()
+              output
+
+            {:error, {_status, output}} ->
+              output
+
+            {:error, output} ->
+              output
           end
 
         {:error, log <> started_log <> rollback_log}
@@ -346,6 +481,10 @@ defmodule DelivestAgent.Commands do
            rollback_safety(project, release, quiesce?),
          {:ok, git_log} <-
            rollback_step("git reset", fn -> git_reset(project.dir, release["git"]) end),
+         {:ok, refs_log} <-
+           rollback_step("restore Compose image references", fn ->
+             Env.restore_site_refs(project, release_refs(release))
+           end),
          {:ok, definitions, definitions_log} <- rollback_definitions(project),
          {:ok, restore_log} <-
            rollback_step("restore previous images", fn ->
@@ -365,7 +504,7 @@ defmodule DelivestAgent.Commands do
         ])
 
       head = section(title, "restored #{release["git"] || release["at"]}")
-      prefix = head <> schema_log <> git_log <> definitions_log <> restore_log
+      prefix = head <> schema_log <> git_log <> refs_log <> definitions_log <> restore_log
 
       case result do
         {:ok, log} -> {:ok, prefix <> log}
@@ -374,6 +513,19 @@ defmodule DelivestAgent.Commands do
       end
     else
       {:error, {_status, log}} -> {:error, {1, log}}
+    end
+  end
+
+  defp release_refs(release) do
+    case release["image_refs_selected"] do
+      %{} = refs ->
+        refs
+
+      _ ->
+        case Release.interrupted_attempt() do
+          {:ok, %{"attempt" => %{"image_refs_before" => refs}}} when is_map(refs) -> refs
+          _ -> %{}
+        end
     end
   end
 
@@ -473,6 +625,76 @@ defmodule DelivestAgent.Commands do
       end
     else
       {:skip, "not a git checkout"}
+    end
+  end
+
+  defp pull_release_images(manifest, components) do
+    Enum.reduce_while(components, {:ok, ""}, fn component, {:ok, log} ->
+      ref = ReleaseManifest.ref(manifest, component)
+
+      case Runner.cmd("docker", ["pull", ref]) do
+        {output, 0} ->
+          {:cont, {:ok, log <> section("pull #{component}", output)}}
+
+        {output, status} ->
+          {:halt, {:error, {status, "cannot pull #{ref}: #{String.trim(output)}"}}}
+      end
+    end)
+  end
+
+  defp git_fetch_release(dir, manifest) do
+    with {:ok, remote} <- git_release(dir, ["remote", "get-url", "origin"]),
+         true <-
+           String.trim(remote) in [
+             "https://github.com/ShafranovKirill/delivest.git",
+             "git@github.com:ShafranovKirill/delivest.git"
+           ],
+         {:ok, output} <-
+           git_release(dir, ["fetch", "--no-recurse-submodules", "origin", manifest["root_sha"]]),
+         {:ok, tree} <- git_release(dir, ["ls-tree", manifest["root_sha"]]) do
+      links = manifest["gitlinks"]
+
+      entries =
+        tree
+        |> String.split("\n", trim: true)
+        |> Map.new(fn line ->
+          case String.split(line, "\t", parts: 2) do
+            [header, path] -> {path, header}
+            _ -> {line, ""}
+          end
+        end)
+
+      if Enum.all?(~w(server client agent), fn component ->
+           entries[component] == "160000 commit #{links[component]}"
+         end) do
+        {:ok, output}
+      else
+        {:error, {1, "release manifest gitlinks do not match the selected root revision"}}
+      end
+    else
+      false -> {:error, {1, "unexpected source repository for release"}}
+      error -> error
+    end
+  end
+
+  defp git_checkout_release(dir, manifest) do
+    with {:ok, output} <- git_release(dir, ["checkout", "--detach", manifest["root_sha"]]),
+         {:ok, submodules} <-
+           git_release(dir, ["submodule", "update", "--init", "server", "client"]) do
+      {:ok, output <> submodules}
+    end
+  end
+
+  defp git_release(dir, args) do
+    if File.exists?(Path.join(dir, ".git")) do
+      {command, args} = as_owner(dir, ["git", "-C", dir | args])
+
+      case Runner.cmd(command, args) do
+        {output, 0} -> {:ok, output}
+        {output, status} -> {:error, {status, output}}
+      end
+    else
+      {:error, {1, "release installation requires a git checkout"}}
     end
   end
 
